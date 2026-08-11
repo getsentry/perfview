@@ -21,6 +21,8 @@ using Address = System.UInt64;
 using Microsoft.Diagnostics.Utilities;
 using Microsoft.Diagnostics.HeapDump;
 using Azure.Core;
+using Azure.Identity;
+
 
 
 #if CROSS_GENERATION_LIVENESS
@@ -38,10 +40,10 @@ public class GCHeapDumper
     /// to dump a heap.  
     /// </summary>
     /// <param name="log"></param>
-    public GCHeapDumper(TextWriter log, TokenCredential symbolServerAuthCredential = null)
+    public GCHeapDumper(TextWriter log)
     {
         m_origLog = log;
-        m_symbolServerAuthCredential = symbolServerAuthCredential;
+        SymbolsAuthTokenCredential = new InteractiveBrowserCredential();
         m_copyOfLog = new StringWriter();
         m_log = new TeeTextWriter(m_copyOfLog, m_origLog);
 
@@ -171,6 +173,12 @@ public class GCHeapDumper
 
         m_log.WriteLine("Process Has DotNet: {0} Has JScript: {1} Has ClrDll: {2} HasMrt {3} HasCoreClr {4}", hasDotNet, hasJScript, hasClrDll, hasMrt, hasCoreClr);
 
+        if (!hasDotNet && !hasJScript && !hasMrt && !hasCoreClr)
+        {
+            m_log.WriteLine("No supported runtime type detected, going to assume native AOT.");
+            hasMrt = true;
+        }
+
         if (hasClrDll && hasJScript)
         {
             m_log.WriteLine("[Detected both a JScript and .NET heap, forcing a GC before doing a heap dump.]");
@@ -278,11 +286,11 @@ public class GCHeapDumper
         {
             try
             {
-                dataTarget = DataTarget.CreateSnapshotAndAttach(processID, m_symbolServerAuthCredential);
+                dataTarget = DataTarget.CreateSnapshotAndAttach(processID, SymbolsAuthTokenCredential);
             }
             catch
             {
-                dataTarget = DataTarget.AttachToProcess(processID, Freeze, m_symbolServerAuthCredential);
+                dataTarget = DataTarget.AttachToProcess(processID, Freeze, SymbolsAuthTokenCredential);
             }
         }
         else
@@ -292,7 +300,7 @@ public class GCHeapDumper
                 UseOSMemoryFeatures = false // disable AWE
             };
 
-            dataTarget = DataTarget.LoadDump(processDumpFile, cacheOptions, m_symbolServerAuthCredential);
+            dataTarget = DataTarget.LoadDump(processDumpFile, cacheOptions, SymbolsAuthTokenCredential);
         }
 
         if (dataTarget.DataReader.PointerSize != IntPtr.Size)
@@ -384,6 +392,12 @@ public class GCHeapDumper
     /// The threshold at which we want to dump the heap when collecting cross-generation liveness data.
     /// </summary>
     public ulong PromotedBytesThreshold;
+
+
+    /// <summary>
+    /// The token credential to use for symbol server authentication.
+    /// </summary>
+    public TokenCredential SymbolsAuthTokenCredential;
 
     /// <summary>
     /// Force a .NET GC on a particular process. 
@@ -893,8 +907,8 @@ public class GCHeapDumper
             m_log.WriteLine("We are retrying the dump so we scale the max by {0} to the value {1}", retryScale, m_maxNodeCount);
         }
 
-        // We assume that object on average are 8 object pointers.      
-        int estimatedObjectCount = (int)(totalGCSize / ((uint)(8 * IntPtr.Size)));
+        // We assume that object on average are 8 object pointers.
+        int estimatedObjectCount = (totalGCSize > (8 * (ulong)IntPtr.Size * (ulong)Int32.MaxValue)) ? Int32.MaxValue : (int)(totalGCSize / ((uint)(8 * IntPtr.Size)));
         m_log.WriteLine("Estimated number of objects = {0:n0}", estimatedObjectCount);
 
         // We force the node count to be this max node count if we are within a factor of 2.  
@@ -1572,8 +1586,6 @@ public class GCHeapDumper
     private TextWriter m_log;               // Where we send messages
     private StringWriter m_copyOfLog;       // We keep a copy of all logged messages here to append to output file. 
     private Stopwatch m_sw;                 // We keep track of how long it takes.  
-
-    private TokenCredential m_symbolServerAuthCredential;
 
     private GCHeapDump m_gcHeapDump;        // The image of what we are putting in the file
     private NodeIndex m_JSRoot = NodeIndex.Invalid;     // The root of the JS heap

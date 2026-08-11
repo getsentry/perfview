@@ -29,7 +29,6 @@
         <CommandBinding Command="{x:Static src:MainWindow.MergeCommand}" Executed="DoMerge"/>
         <CommandBinding Command="{x:Static src:MainWindow.ZipCommand}" Executed="DoZip"/>
         <CommandBinding Command="{x:Static src:MainWindow.UnZipCommand}" Executed="DoUnZip"/>
-        <CommandBinding Command="{x:Static src:MainWindow.HideCommand}" Executed="DoHide" CanExecute="CanHide" />
         <CommandBinding Command="{x:Static src:MainWindow.UserCommand}" Executed="DoUserCommand"/>
         <CommandBinding Command="{x:Static src:MainWindow.RefreshDirCommand}" Executed="DoRefreshDir"/>
         <CommandBinding Command="{x:Static src:MainWindow.OpenCommand}" Executed="DoOpen"/>
@@ -59,8 +58,13 @@
     <Window.InputBindings>
         <KeyBinding Gesture="CTRL+L" Command="{x:Static src:MainWindow.FocusDirectoryCommand}" />
     </Window.InputBindings>
-    <DockPanel>
-        <Grid DockPanel.Dock="Top">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Grid Grid.Row="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition/>
@@ -79,9 +83,6 @@
                     <MenuItem Header="Set Symbol _Path" Click="DoSetSymbolPath" ToolTip="Sets the locations to look for symbolic information (PDB files)."/>
                     <MenuItem Header="_User Command" Command="{x:Static src:MainWindow.UserCommand}" ToolTip="Run a User Defined Command."/>
                     <MenuItem Header="Go to Directory" Command="{x:Static src:MainWindow.FocusDirectoryCommand}" ToolTip="Focus and select the directory textbox."/>
-                    <Separator/>
-                    <MenuItem Header="_Hide" Command="{x:Static src:MainWindow.HideCommand}" ToolTip="Hides the current window (can reopen using windows explorer)"/>
-                    <Separator/>
                     <MenuItem Header="_Exit" Click="DoExit"/>
                 </MenuItem>
                 <MenuItem Header="_Collect">
@@ -114,10 +115,10 @@
                 </MenuItem>
                 <MenuItem Header="_Options">
                     <MenuItem Header="_Authentication">
-                        <MenuItem Header="Use _Git Credential Manager" x:Name="Authentication_UseGitCredentialManager" IsChecked="{Binding Path=AuthenticationViewModel.IsGitCredentialManagerEnabled}" Command="{x:Static src:AuthenticationCommands.UseGitCredentialManager}" ToolTip="Use the Git Credential Manager to authenticate to GitHub and Azure DevOps."/>
-                        <MenuItem Header="Use _Developer Identity for Azure DevOps"  x:Name="Authentication_UseManagedIdentityForAzureDevOps" IsChecked="{Binding Path=AuthenticationViewModel.IsDeveloperIdentityEnabled}" Command="{x:Static src:AuthenticationCommands.UseDeveloperIdentity}" ToolTip="Use Visual Studio or VS Code sign-in information to authenticate to Azure DevOps instances."/>
-                        <MenuItem Header="Use Device _Code for GitHub" x:Name="Authentication_UseGitHubDeviceFlow" IsChecked="{Binding Path=AuthenticationViewModel.IsGitHubDeviceFlowEnabled}" Command="{x:Static src:AuthenticationCommands.UseGitHubDeviceFlow}" ToolTip="Use a device code to authenticate with GitHub."/>
-                        <MenuItem Header="Use Basic Http Auth" x:Name="Authentication_UseBasicHttpAuth" IsChecked="{Binding Path=AuthenticationViewModel.IsBasicHttpAuthEnabled}" Command="{x:Static src:AuthenticationCommands.UseBasicHttpAuth}" ToolTip="Use basic HTTP authentication to access a symbol server"/>
+                        <MenuItem Header="Use _Git Credential Manager" x:Name="Authentication_UseGitCredentialManager" IsCheckable="True" IsChecked="{Binding Path=AuthenticationViewModel.IsGitCredentialManagerEnabled}" Command="{x:Static src:AuthenticationCommands.UseGitCredentialManager}" ToolTip="Use the Git Credential Manager to authenticate to GitHub and Azure DevOps."/>
+                        <MenuItem Header="Use _Developer Identity for Azure DevOps"  x:Name="Authentication_UseManagedIdentityForAzureDevOps" IsCheckable="True" IsChecked="{Binding Path=AuthenticationViewModel.IsDeveloperIdentityEnabled}" Command="{x:Static src:AuthenticationCommands.UseDeveloperIdentity}" ToolTip="Use Visual Studio or VS Code sign-in information to authenticate to Azure DevOps instances."/>
+                        <MenuItem Header="Use Device _Code for GitHub" x:Name="Authentication_UseGitHubDeviceFlow" IsCheckable="True" IsChecked="{Binding Path=AuthenticationViewModel.IsGitHubDeviceFlowEnabled}" Command="{x:Static src:AuthenticationCommands.UseGitHubDeviceFlow}" ToolTip="Use a device code to authenticate with GitHub."/>
+                        <MenuItem Header="Use Basic Http Auth" x:Name="Authentication_UseBasicHttpAuth" IsCheckable="True" IsChecked="{Binding Path=AuthenticationViewModel.IsBasicHttpAuthEnabled}" Command="{x:Static src:AuthenticationCommands.UseBasicHttpAuth}" ToolTip="Use basic HTTP authentication to access a symbol server"/>
                     </MenuItem>
                     <MenuItem Header="Do not shorten frames copied from stack windows" x:Name="Option_DoNotCompressStackFramesOnCopy" IsCheckable="True" Click="ToggleDoNotCompressStackFramesOnCopy" ToolTip="When pasting stack frame lines copied from the Stack Viewer window, paste the full contents of each line instead of a minimized version." />
                     <MenuItem Header="_Experimental">
@@ -126,9 +127,9 @@
                     <MenuItem Header="Navigate to last used directory on launch." x:Name="Option_OpenToLastUsedDirectory" IsCheckable="true" Click="ToggleOpenToLastUsedDirectory" ToolTip="When launching PerfView, navigate to the last opened directory instead of the current working directory."/>
                     <MenuItem Header="Truncate raw data when dumping an event" x:Name="Option_TruncateRawEventData" IsCheckable="True" Click="ToggleTruncateRawEventData" ToolTip="Controls whether or not a raw event dumped from the events view is truncated." />
                     <MenuItem Header="Theme">
-                        <MenuItem Header="Light" x:Name="Theme_Light" IsChecked="{Binding Path=ThemeViewModel.IsLightTheme}" Command="{x:Static src:ThemeViewModel.SetLightThemeCommand}"/>
-                        <MenuItem Header="Dark" x:Name="Theme_Dark" IsChecked="{Binding Path=ThemeViewModel.IsDarkTheme}" Command="{x:Static src:ThemeViewModel.SetDarkThemeCommand}"/>
-                        <MenuItem Header="System" x:Name="Theme_System" IsChecked="{Binding Path=ThemeViewModel.IsSystemTheme}" Command="{x:Static src:ThemeViewModel.SetSystemThemeCommand}"/>
+                        <MenuItem Header="Light" x:Name="Theme_Light" IsCheckable="True" IsChecked="{Binding Path=ThemeViewModel.IsLightTheme}" Command="{x:Static src:ThemeViewModel.SetLightThemeCommand}"/>
+                        <MenuItem Header="Dark" x:Name="Theme_Dark" IsCheckable="True" IsChecked="{Binding Path=ThemeViewModel.IsDarkTheme}" Command="{x:Static src:ThemeViewModel.SetDarkThemeCommand}"/>
+                        <MenuItem Header="System" x:Name="Theme_System" IsCheckable="True" IsChecked="{Binding Path=ThemeViewModel.IsSystemTheme}" Command="{x:Static src:ThemeViewModel.SetSystemThemeCommand}"/>
                     </MenuItem>
                 </MenuItem>
                 <MenuItem Header="_Help">
@@ -171,16 +172,20 @@
             <Button Name="WikiButton" Grid.Column="7" Margin="5,1,10,1" Content="Wiki" FontSize="9"
                     ToolTip="Goto the PerfView Wiki." Click="DoWikiClick"/>
         </Grid>
-        <src:StatusBar x:Name="StatusBar" DockPanel.Dock="Bottom"/>
-        <Grid>
+        <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="220*"/>
                 <ColumnDefinition Width="auto"/>
                 <ColumnDefinition Width="619*"/>
             </Grid.ColumnDefinitions>
-            <DockPanel Background="Gray" Grid.Column="0">
-                <controls:HistoryComboBox x:Name="Directory" DockPanel.Dock="Top" AutomationProperties.Name="Directory Search Bar"
-                         ToolTip="This is the directory to search for performance data files." TextEntered="DoTextEnteredInDirectoryTextBox" />
+            <DockPanel Background="{DynamicResource ContainerBackground}" Grid.Column="0">
+                <DockPanel DockPanel.Dock="Top">
+                    <Label x:Name="DirectoryLabel" Content="Path:" Target="{Binding ElementName=Directory}"
+                           VerticalAlignment="Center" Padding="5,0" />
+                    <controls:HistoryComboBox x:Name="Directory" AutomationProperties.Name="Directory Search Bar"
+                             AutomationProperties.LabeledBy="{Binding ElementName=DirectoryLabel}"
+                             ToolTip="This is the directory to search for performance data files." TextEntered="DoTextEnteredInDirectoryTextBox" />
+                </DockPanel>
                 <Grid DockPanel.Dock="Top" >
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
@@ -231,12 +236,15 @@
             <GridSplitter Grid.Column="1" Width="3"  HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
             <RichTextBox Name="Body" Grid.Column="2" IsReadOnly="True" IsDocumentEnabled="True"
                          IsEnabled="{Binding ElementName=StatusBar, Path=IsNotWorking}"
+                         FocusVisualStyle="{DynamicResource AccessibleFocusVisual}"
                          VerticalScrollBarVisibility="auto" AutomationProperties.Name="Usage Information">
                 <RichTextBox.Resources>
                     <Style TargetType="{x:Type Paragraph}">
                         <Setter Property="Margin" Value="0"/>
                     </Style>
-
+                    <Style TargetType="{x:Type Hyperlink}" BasedOn="{StaticResource {x:Type Hyperlink}}">
+                        <Setter Property="FocusVisualStyle" Value="{DynamicResource AccessibleFocusVisual}"/>
+                    </Style>
                 </RichTextBox.Resources>
                 <RichTextBox.Document>
                     <FlowDocument>
@@ -349,5 +357,6 @@
                 </RichTextBox.Document>
             </RichTextBox>
         </Grid>
-    </DockPanel>
+        <src:StatusBar x:Name="StatusBar" Grid.Row="2"/>
+    </Grid>
 </Window>

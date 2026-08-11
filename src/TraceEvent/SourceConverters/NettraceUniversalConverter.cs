@@ -1,14 +1,18 @@
 ﻿using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Universal.Events;
+using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 namespace Microsoft.Diagnostics.Tracing.SourceConverters
 {
     internal sealed class NettraceUniversalConverter
     {
+        private const string DotnetJittedCodeMappingName = "/memfd:doublemapper";
+
         private List<ProcessSymbolTraceData> _dynamicSymbols = new List<ProcessSymbolTraceData>();
-        private Dictionary<ulong, TraceProcess> _mappingIdToProcesses = new Dictionary<ulong, TraceProcess>();
+        private Dictionary<ulong, HashSet<TraceProcess>> _mappingIdToProcesses = new Dictionary<ulong, HashSet<TraceProcess>>();
         private Dictionary<ulong, ProcessMappingMetadataTraceData> _mappingMetadata = new Dictionary<ulong, ProcessMappingMetadataTraceData>();
 
         internal NettraceUniversalConverter()
@@ -23,6 +27,15 @@ namespace Microsoft.Diagnostics.Tracing.SourceConverters
 
         public void BeforeProcess(TraceLog traceLog, TraceEventDispatcher source)
         {
+            // Extract system page size for ELF RVA calculations.
+            if (source is EventPipeEventSource eventPipeSource)
+            {
+                eventPipeSource.HeadersDeserialized += delegate ()
+                {
+                    traceLog.systemPageSize = eventPipeSource._systemPageSize;
+                };
+            }
+
             UniversalSystemTraceEventParser universalSystemParser = new UniversalSystemTraceEventParser(source);
             universalSystemParser.ExistingProcess += delegate (ProcessCreateTraceData data)
             {
@@ -41,11 +54,24 @@ namespace Microsoft.Diagnostics.Tracing.SourceConverters
             };
             universalSystemParser.ProcessMapping += delegate (ProcessMappingTraceData data)
             {
-                _mappingMetadata.TryGetValue(data.MetadataId, out ProcessMappingMetadataTraceData metadata);
                 TraceProcess process = traceLog.Processes.GetOrCreateProcess(data.ProcessID, data.TimeStampQPC);
-                TraceModuleFile moduleFile = process.LoadedModules.UniversalMapping(data, metadata);
+                if (!_mappingIdToProcesses.TryGetValue(data.Id, out HashSet<TraceProcess> processes))
+                {
+                    processes = new HashSet<TraceProcess>();
+                    _mappingIdToProcesses[data.Id] = processes;
+                }
+                processes.Add(process);
 
-                _mappingIdToProcesses[data.Id] = process;
+                string fileName = data.FileName;
+                if (!string.IsNullOrEmpty(fileName) && fileName.StartsWith(DotnetJittedCodeMappingName, StringComparison.Ordinal))
+                {
+                    // Don't create a module for jitted code.
+                    // These will be created for each jitted code symbol.
+                    return;
+                }
+
+                _mappingMetadata.TryGetValue(data.MetadataId, out ProcessMappingMetadataTraceData metadata);
+                TraceModuleFile moduleFile = process.LoadedModules.UniversalMapping(fileName, data.StartAddress, data.EndAddress, data.TimeStampQPC, metadata);
             };
             universalSystemParser.ProcessMappingMetadata += delegate (ProcessMappingMetadataTraceData data)
             {
@@ -69,11 +95,44 @@ namespace Microsoft.Diagnostics.Tracing.SourceConverters
         {
             foreach (var universalProcessSymbol in _dynamicSymbols)
             {
-                if (_mappingIdToProcesses.TryGetValue(universalProcessSymbol.MappingId, out TraceProcess process))
+                if (_mappingIdToProcesses.TryGetValue(universalProcessSymbol.MappingId, out HashSet<TraceProcess> processes))
                 {
-                    traceLog.CodeAddresses.AddUniversalDynamicSymbol(universalProcessSymbol, process);
+                    foreach (TraceProcess process in processes)
+                    {
+                        traceLog.CodeAddresses.AddUniversalDynamicSymbol(universalProcessSymbol, process);
+                    }
                 }
             }
+        }
+
+        /// <summary>
+        /// Regular expression for parsing dotnet jitted symbol names from universal traces.
+        /// Format: "returnType [module] Namespace.Class::Method(args...)[OptimizationLevel]"
+        /// The return type can be multi-word (e.g., "instance void", "valuetype [Type]Type").
+        /// </summary>
+        private static readonly Regex s_jittedSymbolRegex =
+            new Regex(@"^(?<returnType>.+?)\s+\[(?<module>[^\]]+)\]\s+(?<methodSignature>.+?)\[(?<optimizationLevel>[^\]]+)\]$",
+                RegexOptions.Compiled);
+
+        /// <summary>
+        /// Parses a dotnet jitted symbol name from universal traces with format: "returnType [module] Namespace.Class::Method(args...)[OptimizationLevel]"
+        /// and returns the module name and method signature.
+        /// </summary>
+        internal static (string moduleName, string methodSignature)? ParseDotnetJittedSymbolName(string symbolName)
+        {
+            if (!string.IsNullOrEmpty(symbolName))
+            {
+                var match = s_jittedSymbolRegex.Match(symbolName);
+
+                if (match.Success)
+                {
+                    string module = match.Groups["module"].Value;
+                    string methodSignature = match.Groups["methodSignature"].Value.Trim();
+                    return (module, methodSignature);
+                }
+            }
+
+            return null;
         }
     }
 }

@@ -342,7 +342,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             clrRundownParser.MethodDCStopVerbose += delegate (MethodLoadUnloadVerboseTraceData data)
             {
                 // Note: we need this also for non-jitted methods, otherwise we won't resolve some frames, for example:
-                //      "System.Private.CoreLib.il" - "System.Threading.Tasks.Task.Wait()"
+                //      "System.Private.CoreLib" - "System.Threading.Tasks.Task.Wait()"
                 TraceProcess process = processes.GetOrCreateProcess(data.ProcessID, data.TimeStampQPC);
                 process.InsertJITTEDMethod(data.MethodStartAddress, data.MethodSize, delegate ()
                 {
@@ -374,7 +374,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             var extendedDataCount = data.eventRecord->ExtendedDataCount;
             if (extendedDataCount != 0)
             {
-                bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent);
+                bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent, isLiveSession: true);
             }
 
             // This must occur after the call to ProcessExtendedData to ensure that if there is a stack for this event,
@@ -858,7 +858,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 var extendedDataCount = data.eventRecord->ExtendedDataCount;
                 if (extendedDataCount != 0)
                 {
-                    bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent);
+                    bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent, isLiveSession: true);
                 }
 
                 // This must occur after the call to ProcessExtendedData to ensure that if there is a stack for this event,
@@ -1233,6 +1233,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             new SampleProfilerTraceEventParser(this);
             new WpfTraceEventParser(this);
+            new ApplicationServerTraceEventParser(this);
 
             var dynamicParser = Dynamic;
 
@@ -1557,12 +1558,15 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 // TODO review:  is using the timestamp the best way to make the association
                 if (lastDbgData != null && data.TimeStampQPC == lastDbgData.TimeStampQPC)
                 {
-                    moduleFile.pdbName = lastDbgData.PdbFileName;
-                    moduleFile.pdbSignature = lastDbgData.GuidSig;
-                    moduleFile.pdbAge = lastDbgData.Age;
-                    // There is no guarantee that the names of the DLL and PDB match, but they do 99% of the time
-                    // We tolerate the exceptions, because it is a useful check most of the time
-                    Debug.Assert(RoughDllPdbMatch(moduleFile.fileName, moduleFile.pdbName));
+                    if (moduleFile.MatchOrInitPE() is { } peInfo)
+                    {
+                        peInfo.PdbName = lastDbgData.PdbFileName;
+                        peInfo.PdbSignature = lastDbgData.GuidSig;
+                        peInfo.PdbAge = lastDbgData.Age;
+                        // There is no guarantee that the names of the DLL and PDB match, but they do 99% of the time
+                        // We tolerate the exceptions, because it is a useful check most of the time
+                        Debug.Assert(RoughDllPdbMatch(moduleFile.fileName, moduleFile.PdbName));
+                    }
                 }
                 moduleFile.timeDateStamp = data.TimeDateStamp;
                 moduleFile.imageChecksum = data.ImageChecksum;
@@ -1593,14 +1597,17 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 hasPdbInfo = true;
 
                 // The ImageIDDbgID_RSDS may be after the ImageLoad
-                if (lastTraceModuleFile != null && lastTraceModuleFileQPC == data.TimeStampQPC && string.IsNullOrEmpty(lastTraceModuleFile.pdbName))
+                if (lastTraceModuleFile != null && lastTraceModuleFileQPC == data.TimeStampQPC && string.IsNullOrEmpty(lastTraceModuleFile.PdbName))
                 {
-                    lastTraceModuleFile.pdbName = data.PdbFileName;
-                    lastTraceModuleFile.pdbSignature = data.GuidSig;
-                    lastTraceModuleFile.pdbAge = data.Age;
-                    // There is no guarantee that the names of the DLL and PDB match, but they do 99% of the time
-                    // We tolerate the exceptions, because it is a useful check most of the time
-                    Debug.Assert(RoughDllPdbMatch(lastTraceModuleFile.fileName, lastTraceModuleFile.pdbName));
+                    if (lastTraceModuleFile.MatchOrInitPE() is { } peInfo)
+                    {
+                        peInfo.PdbName = data.PdbFileName;
+                        peInfo.PdbSignature = data.GuidSig;
+                        peInfo.PdbAge = data.Age;
+                        // There is no guarantee that the names of the DLL and PDB match, but they do 99% of the time
+                        // We tolerate the exceptions, because it is a useful check most of the time
+                        Debug.Assert(RoughDllPdbMatch(lastTraceModuleFile.fileName, lastTraceModuleFile.PdbName));
+                    }
                     lastDbgData = null;
                 }
                 else  // Or before (it is handled in ImageGroup callback above)
@@ -2269,7 +2276,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 var extendedDataCount = data.eventRecord->ExtendedDataCount;
                 if (extendedDataCount != 0)
                 {
-                    bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent);
+                    bookKeepingEvent |= ProcessExtendedData(data, extendedDataCount, countForEvent, isLiveSession: false);
                 }
 
                 if (bookKeepingEvent)
@@ -3245,7 +3252,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// Process any extended data (like Win7 style stack traces) associated with 'data'
         /// returns true if the event should be considered a bookkeeping event.
         /// </summary>
-        internal unsafe bool ProcessExtendedData(TraceEvent data, ushort extendedDataCount, TraceEventCounts countForEvent)
+        internal unsafe bool ProcessExtendedData(TraceEvent data, ushort extendedDataCount, TraceEventCounts countForEvent, bool isLiveSession)
         {
             var isBookkeepingEvent = false;
             var extendedData = data.eventRecord->ExtendedData;
@@ -3334,72 +3341,79 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                         }
                     }
                 }
-                else if (extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID)
+                // In live sessions, preserve the original ExtendedData for readers to access directly.
+                // Only persist RelatedActivityID in file conversion mode.
+                else if (!isLiveSession && extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID)
                 {
                     relatedActivityIDPtr = (Guid*)(extendedData[i].DataPtr);
                 }
-                else if (extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_CONTAINER_ID)
+                else if (!isLiveSession && extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_CONTAINER_ID)
                 {
                     containerID = Marshal.PtrToStringAnsi((IntPtr)extendedData[i].DataPtr, (int)extendedData[i].DataSize);
                 }
             }
 
-            if (relatedActivityIDPtr != null)
+            // Only persist RelatedActivityID and modify ExtendedData during file conversion.
+            // In live sessions, preserve the original ExtendedData pointers for readers to access.
+            if (!isLiveSession)
             {
-                if (relatedActivityIDs.Count == 0)
+                if (relatedActivityIDPtr != null)
                 {
-                    // Insert a synthetic value since 0 represents "no related activity ID".
-                    relatedActivityIDs.Add(Guid.Empty);
-                }
+                    if (relatedActivityIDs.Count == 0)
+                    {
+                        // Insert a synthetic value since 0 represents "no related activity ID".
+                        relatedActivityIDs.Add(Guid.Empty);
+                    }
 
-                // TODO This is a bit of a hack.   We wack this field in place.
-                // We encode this as index into the relatedActivityID GrowableArray.
-                if (IntPtr.Size == 8)
-                {
-                    data.eventRecord->ExtendedData = (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)(relatedActivityIDs.Count << 4);
+                    // TODO This is a bit of a hack.   We wack this field in place.
+                    // We encode this as index into the relatedActivityID GrowableArray.
+                    if (IntPtr.Size == 8)
+                    {
+                        data.eventRecord->ExtendedData = (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)(relatedActivityIDs.Count << 4);
+                    }
+                    else
+                    {
+                        data.eventRecord->ExtendedData = (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)relatedActivityIDs.Count;
+                    }
+                    relatedActivityIDs.Add(*relatedActivityIDPtr);
                 }
                 else
                 {
-                    data.eventRecord->ExtendedData = (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)relatedActivityIDs.Count;
-                }
-                relatedActivityIDs.Add(*relatedActivityIDPtr);
-            }
-            else
-            {
-                data.eventRecord->ExtendedData = null;
-            }
-
-            if (containerID != null)
-            {
-                // TODO This is a bit of a hack.   We wack this field in place.
-                // We encode this as index into the containerIDs GrowableArray.
-                if (containerIDs.Count == 0)
-                {
-                    // Insert a synthetic value since 0 represents "no container ID".
-                    containerIDs.Add(null);
+                    data.eventRecord->ExtendedData = null;
                 }
 
-                // Look for the container ID.
-                bool found = false;
-                for (int i = 0; i < containerIDs.Count; i++)
+                if (containerID != null)
                 {
-                    if (containerIDs[i] == containerID)
+                    // TODO This is a bit of a hack.   We wack this field in place.
+                    // We encode this as index into the containerIDs GrowableArray.
+                    if (containerIDs.Count == 0)
                     {
-                        data.eventRecord->ExtendedDataCount = (ushort)i;
-                        found = true;
-                        break;
+                        // Insert a synthetic value since 0 represents "no container ID".
+                        containerIDs.Add(null);
+                    }
+
+                    // Look for the container ID.
+                    bool found = false;
+                    for (int i = 0; i < containerIDs.Count; i++)
+                    {
+                        if (containerIDs[i] == containerID)
+                        {
+                            data.eventRecord->ExtendedDataCount = (ushort)i;
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        data.eventRecord->ExtendedDataCount = (ushort)containerIDs.Count;
+                        containerIDs.Add(containerID);
                     }
                 }
-
-                if (!found)
+                else
                 {
-                    data.eventRecord->ExtendedDataCount = (ushort)containerIDs.Count;
-                    containerIDs.Add(containerID);
+                    data.eventRecord->ExtendedDataCount = 0;
                 }
-            }
-            else
-            {
-                data.eventRecord->ExtendedDataCount = 0;
             }
 
             return isBookkeepingEvent;
@@ -3655,21 +3669,20 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <returns></returns>
         internal unsafe TraceEventDispatcher AllocLookup()
         {
-            if (freeLookup == null)
+            // Use Interlocked.Exchange to atomically take the cached dispatcher (setting the field to null).
+            // This prevents a race where two threads both read the non-null value before either sets it to null.
+            TraceEventDispatcher ret = Interlocked.Exchange(ref freeLookup, null);
+            if (ret == null)
             {
-                freeLookup = AddAllTemplatesToDispatcher(new TraceLogEventSource(events));
+                ret = AddAllTemplatesToDispatcher(new TraceLogEventSource(events));
             }
 
-            TraceEventDispatcher ret = freeLookup;
-            freeLookup = null;
             return ret;
         }
         internal unsafe void FreeLookup(TraceEventDispatcher lookup)
         {
-            if (freeLookup == null)
-            {
-                freeLookup = lookup;
-            }
+            // Use Interlocked.CompareExchange to atomically store the dispatcher back only if the slot is empty.
+            Interlocked.CompareExchange(ref freeLookup, lookup, null);
         }
 
         private void InitializeFromFile(string etlxFilePath)
@@ -3795,6 +3808,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             return true;
         }
 #endif
+
         void IFastSerializable.ToStream(Serializer serializer)
         {
             // Write out the events themselves, Before we do this we write a reference past the end of the
@@ -4133,7 +4147,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
         int IFastSerializableVersion.Version
         {
-            get { return 76; }
+            get { return 78; }
         }
         int IFastSerializableVersion.MinimumVersionCanRead
         {
@@ -4158,6 +4172,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         private string etlxFilePath;
         private int memorySizeMeg;
         private int eventsLost;
+        internal ulong systemPageSize;
         private string osName;
         private string osBuild;
         private long bootTime100ns;     // This is a windows FILETIME object
@@ -4725,6 +4740,19 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             sb.AppendLine("</TraceEventStats>");
             return sb.ToString();
+        }
+
+        internal bool Contains(Guid providerId, string eventNameSearchVal)
+        {
+            foreach (var counts in m_counts.Values)
+            {
+                if (counts.ProviderGuid == providerId &&
+                    counts.EventName.Contains(eventNameSearchVal))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         #region private
@@ -7020,18 +7048,10 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             }
             // This is the CoreCLR (First Generation) ReadyToRun case.   There still is a native PDB that is distinct
             // from the IL PDB.   Unlike CoreCLR NGEN, it is logged as a IL file, but it has native code (and thus an NativePdbSignature)
-            // We treat the image as a native image and dummy up a il image to hang the IL PDB information on.
+            // We treat the image as a native image.  The IL module uses the same path since there's no separate IL-only file on disk.
             else if (nativeModulePath.Length == 0 && nativePdbSignature != Guid.Empty && data.ManagedPdbSignature != Guid.Empty)
             {
-                // And make up a fake .il.dll module for the IL
-                var suffixPos = ilModulePath.LastIndexOf(".", StringComparison.OrdinalIgnoreCase);
-                if (0 < suffixPos)
-                {
-                    // We treat the image as the native path
-                    nativeModulePath = ilModulePath;
-                    // and make up a dummy IL path.
-                    ilModulePath = ilModulePath.Substring(0, suffixPos) + ".il" + ilModulePath.Substring(suffixPos);
-                }
+                nativeModulePath = ilModulePath;
             }
 
             int index;
@@ -7057,11 +7077,14 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 process.Log.ModuleFiles.SetModuleFileName(module.ModuleFile, ilModulePath);
             }
 
-            if (module.ModuleFile.pdbSignature == Guid.Empty && data.ManagedPdbSignature != Guid.Empty)
+            if (module.ModuleFile.PdbSignature == Guid.Empty && data.ManagedPdbSignature != Guid.Empty)
             {
-                module.ModuleFile.pdbSignature = data.ManagedPdbSignature;
-                module.ModuleFile.pdbAge = data.ManagedPdbAge;
-                module.ModuleFile.pdbName = data.ManagedPdbBuildPath;
+                if (module.ModuleFile.MatchOrInitPE() is { } peInfo)
+                {
+                    peInfo.PdbSignature = data.ManagedPdbSignature;
+                    peInfo.PdbAge = data.ManagedPdbAge;
+                    peInfo.PdbName = data.ManagedPdbBuildPath;
+                }
             }
 
             if (module.NativeModule != null)
@@ -7070,11 +7093,14 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                     module.NativeModule.ModuleFile.managedModule.FilePath == module.ModuleFile.FilePath);
 
                 module.NativeModule.ModuleFile.managedModule = module.ModuleFile;
-                if (nativePdbSignature != Guid.Empty && module.NativeModule.ModuleFile.pdbSignature == Guid.Empty)
+                if (nativePdbSignature != Guid.Empty && module.NativeModule.ModuleFile.PdbSignature == Guid.Empty)
                 {
-                    module.NativeModule.ModuleFile.pdbSignature = nativePdbSignature;
-                    module.NativeModule.ModuleFile.pdbAge = data.NativePdbAge;
-                    module.NativeModule.ModuleFile.pdbName = data.NativePdbBuildPath;
+                    if (module.NativeModule.ModuleFile.MatchOrInitPE() is { } nativePeInfo)
+                    {
+                        nativePeInfo.PdbSignature = nativePdbSignature;
+                        nativePeInfo.PdbAge = data.NativePdbAge;
+                        nativePeInfo.PdbName = data.NativePdbBuildPath;
+                    }
                 }
 
                 module.InitializeNativeModuleIsReadyToRun();
@@ -7106,31 +7132,46 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
         internal TraceModuleFile UniversalMapping(ProcessMappingTraceData data, ProcessMappingMetadataTraceData metadata)
         {
+            return UniversalMapping(data.FileName, data.StartAddress, data.EndAddress, data.TimeStampQPC, metadata);
+        }
+
+        internal TraceModuleFile UniversalMapping(string fileName, Address startAddress, Address endAddress, long timeStampQPC, ProcessMappingMetadataTraceData metadata)
+        {
             int index;
 
             // A loaded and managed modules depend on a module file, so get or create one.
-            // TODO: We'll need to store FileOffset as well to handle elf images.
-            TraceModuleFile moduleFile = process.Log.ModuleFiles.GetOrCreateModuleFile(data.FileName, data.StartAddress);
-            moduleFile.imageSize = (long)(data.EndAddress - data.StartAddress);
+            // The key is the file name.  For jitted code on Linux, this will be a memfd with a static name, which is OK
+            // because this path will use the StartAddress to ensure that we get the right one.
+            TraceModuleFile moduleFile = process.Log.ModuleFiles.GetOrCreateModuleFile(fileName, startAddress);
+            long newImageSize = (long)(endAddress - startAddress);
+            
+            // New mappings will have an imageSize of 0 and will get set.
+            // Existing mappings that have the same StartAddress but increase in length will get updated here.
+            if (moduleFile.imageSize < newImageSize)
+            {
+                moduleFile.imageSize = newImageSize;
+            }
 
-            // Get or create the loaded module.
-            TraceLoadedModule loadedModule = FindModuleAndIndexContainingAddress(data.StartAddress, data.TimeStampQPC, out index);
-            if (loadedModule == null)
-            {   
+            // The loaded module is looked up by StartAddress and time to ensure that we don't use a module that hasn't been loaded yet.
+            // If the StartAddress or size don't match, then create a new one.  This handles overlapping cases.
+            TraceLoadedModule loadedModule = FindModuleAndIndexContainingAddress(startAddress, timeStampQPC, out index);
+            if (loadedModule == null || loadedModule.ImageBase != startAddress || loadedModule.ModuleFile.imageSize != newImageSize)
+            {
                 // The module file is what is used when looking up the module for an arbitrary address, so it must save both the start address and image size.
-                loadedModule = new TraceLoadedModule(process, moduleFile, data.StartAddress);
-                
-                // All mappings are enumerated at the beginning of the trace.
-                loadedModule.loadTimeQPC = process.Log.sessionStartTimeQPC;
-                
+                loadedModule = new TraceLoadedModule(process, moduleFile, startAddress);
+
+                // Set the timestamp from the mapping data
+                loadedModule.loadTimeQPC = timeStampQPC;
+
                 InsertAndSetOverlap(index + 1, loadedModule);
             }
 
             // Get or create a managed module.  This module is the container for dynamic symbols.
-            TraceManagedModule managedModule = FindManagedModuleAndIndex((long)data.StartAddress, data.TimeStampQPC, out index);
+            TraceManagedModule managedModule = FindManagedModuleAndIndex((long)startAddress, timeStampQPC, out index);
             if (managedModule == null)
             {
-                managedModule = new TraceManagedModule(process, moduleFile, (long)data.StartAddress);
+                managedModule = new TraceManagedModule(process, moduleFile, (long)startAddress);
+                managedModule.loadTimeQPC = timeStampQPC;
                 modules.Insert(index + 1, managedModule);
             }
 
@@ -7141,16 +7182,31 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             Debug.Assert(moduleFile != null);
             CheckClassInvarients();
 
-            PEProcessMappingSymbolMetadata symbolMetadata = metadata?.ParsedSymbolMetadata as PEProcessMappingSymbolMetadata;
-            if (symbolMetadata != null)
+            PEProcessMappingSymbolMetadata peMetadata = metadata?.ParsedSymbolMetadata as PEProcessMappingSymbolMetadata;
+            if (peMetadata != null)
             {
-                moduleFile.pdbName = symbolMetadata.PdbName;
-                moduleFile.pdbAge = symbolMetadata.PdbAge;
-                moduleFile.pdbSignature = symbolMetadata.PdbSignature;
-                moduleFile.r2rPerfMapSignature = symbolMetadata.PerfmapSignature;
-                moduleFile.r2rPerfMapVersion = symbolMetadata.PerfmapVersion;
-                moduleFile.r2rPerfMapName = symbolMetadata.PerfmapName;
-                moduleFile.r2rImageTextVirtualOffset = (uint)symbolMetadata.TextOffset;
+                if (moduleFile.MatchOrInitPE() is { } peInfo)
+                {
+                    peInfo.PdbName = peMetadata.PdbName;
+                    peInfo.PdbAge = peMetadata.PdbAge;
+                    peInfo.PdbSignature = peMetadata.PdbSignature;
+                    peInfo.R2RPerfMapSignature = peMetadata.PerfmapSignature;
+                    peInfo.R2RPerfMapVersion = peMetadata.PerfmapVersion;
+                    peInfo.R2RPerfMapName = peMetadata.PerfmapName;
+                    peInfo.R2RImageTextVirtualOffset = (uint)peMetadata.TextOffset;
+                }
+            }
+
+            ELFProcessMappingSymbolMetadata elfMetadata = metadata?.ParsedSymbolMetadata as ELFProcessMappingSymbolMetadata;
+            if (elfMetadata != null)
+            {
+                if (moduleFile.MatchOrInitElf() is { } elfInfo)
+                {
+                    elfInfo.BuildId = elfMetadata.BuildId;
+                    elfInfo.VirtualAddress = elfMetadata.VirtualAddress;
+                    elfInfo.FileOffset = elfMetadata.FileOffset;
+                    elfInfo.PageSize = process.Log.systemPageSize;
+                }
             }
 
             return moduleFile;
@@ -7586,7 +7642,10 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         {
             if (NativeModule != null && (flags & ModuleFlags.ReadyToRunModule) != ModuleFlags.None)
             {
-                NativeModule.ModuleFile.isReadyToRun = true;
+                if (NativeModule.ModuleFile.MatchOrInitPE() is { } pe)
+                {
+                    pe.IsReadyToRun = true;
+                }
             }
         }
 
@@ -8293,7 +8352,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                         {
                             // In CoreCLR, the managed image IS the native image, so has a .ni suffix, remove it if present.
                             var moduleFileName = moduleFile.ManagedModule.Name;
-                            if (moduleFileName.EndsWith(".ni", StringComparison.OrdinalIgnoreCase) || moduleFileName.EndsWith(".il", StringComparison.OrdinalIgnoreCase))
+                            if (moduleFileName.EndsWith(".ni", StringComparison.OrdinalIgnoreCase))
                             {
                                 moduleFileName = moduleFileName.Substring(0, moduleFileName.Length - 3);
                             }
@@ -8510,11 +8569,23 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal void AddUniversalDynamicSymbol(ProcessSymbolTraceData data, TraceProcess process)
         {
             Debug.Assert(process != null);
+
+            // EndAddress is inclusive, so add one to get the exclusive length.
+            long symbolLength = (long)(data.EndAddress - data.StartAddress + 1);
+
+            // Skip symbols with invalid address ranges. The length parameter to ForAllUnresolvedCodeAddressesInRange
+            // is a signed long, so ranges whose unsigned size exceeds long.MaxValue (e.g., [0x0, 0xFFFFFFFFFFFFFFFF)
+            // from zeroed /proc/kallsyms on Linux without root) would overflow to a negative value and must be rejected.
+            if (symbolLength <= 0)
+            {
+                return;
+            }
+
             dynamicMethodCount++;
             MethodIndex methodIndex = Microsoft.Diagnostics.Tracing.Etlx.MethodIndex.Invalid;
             ModuleFileIndex moduleFileIndex = Microsoft.Diagnostics.Tracing.Etlx.ModuleFileIndex.Invalid;
             TraceManagedModule module = null;
-            ForAllUnresolvedCodeAddressesInRange(process, data.StartAddress, (int)(data.EndAddress - data.StartAddress), true, delegate (ref CodeAddressInfo info)
+            ForAllUnresolvedCodeAddressesInRange(process, data.StartAddress, symbolLength, true, delegate (ref CodeAddressInfo info)
             {
                 // If we already resolved, that means that the address was reused, so only add something if it does not already have
                 // information associated with it.
@@ -8524,16 +8595,45 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                     if (module == null)
                     {
                         int index;
+                        string moduleName = "UNKNOWN";
+                        string methodName = data.Name;
                         TraceLoadedModule loadedModule = process.LoadedModules.FindModuleAndIndexContainingAddress(data.StartAddress, data.TimeStampQPC, out index);
+
+                        // Try to parse the symbol as a universal symbol.
+                        var parsed = NettraceUniversalConverter.ParseDotnetJittedSymbolName(data.Name);
+                        if (parsed.HasValue)
+                        {
+                            moduleName = parsed.Value.moduleName;
+                            methodName = parsed.Value.methodSignature;
+                        }
+
+                        // We don't create a blanket jitted code module, so create one here.
+                        // Non-jitted symbols will already have a module, so loadedModule will not be null.
+                        if (loadedModule == null)
+                        {
+                            TraceModuleFile moduleFile = process.LoadedModules.UniversalMapping(moduleName, data.StartAddress, data.EndAddress, data.TimeStampQPC, null);
+                            loadedModule = process.LoadedModules.FindModuleAndIndexContainingAddress(data.StartAddress, data.TimeStampQPC, out index);
+                        }
+
+                        // If the module still can't be found (e.g. invalid image size), skip this symbol.
+                        if (loadedModule == null)
+                        {
+                            return;
+                        }
+
                         module = process.LoadedModules.GetOrCreateManagedModule(loadedModule.ModuleID, data.TimeStampQPC);
                         moduleFileIndex = module.ModuleFile.ModuleFileIndex;
-                        methodIndex = methods.NewMethod(data.Name, moduleFileIndex, (int)data.Id);
+                            
+                        methodIndex = methods.NewMethod(methodName, moduleFileIndex, (int)data.Id);
                         
                         // When universal traces support re-use of address space, we'll need to support it here.
                     }
 
-                    // Set the info
-                    info.SetMethodIndex(this, methodIndex);
+                    // Set the info (only if we found a module)
+                    if (module != null)
+                    {
+                        info.SetMethodIndex(this, methodIndex);
+                    }
                 }
             });
         }
@@ -8831,26 +8931,83 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             reader.m_log.WriteLine("[Loading symbols for " + moduleFile.FilePath + "]");
 
-            // There is where we hook up R2R symbol lookup for Linux.  These symbol modules are .r2rmap files.
-            // The R2R modules that are used on Linux still have a pointer to the IL PDB, so we need to look for a R2R symbol module
-            // before attempting to lookup a PDB, or we may end up with an IL PDB, which won't be helpful for symbol lookup.
-            // For Windows traces this call will always return immediately because the module won't have any R2R perfmap information.
+            // Dispatch symbol lookup by binary format.
             ISymbolLookup symbolLookup = null;
-            R2RPerfMapSymbolModule r2rSymbolModule = OpenR2RPerfMapForModuleFile(reader, moduleFile);
-            if (r2rSymbolModule != null)
+            Func<Address, uint> computeRva = null;
+            switch (moduleFile.BinaryFormat)
             {
-                symbolLookup = r2rSymbolModule;
-            }
-            else
-            {
-                NativeSymbolModule moduleReader = OpenPdbForModuleFile(reader, moduleFile) as NativeSymbolModule;
-                if (moduleReader == null)
-                {
-                    reader.m_log.WriteLine("Could not find PDB file.");
-                    return;
-                }
+                case ModuleBinaryFormat.ELF:
+                    {
+                        ElfSymbolModule elfModule = OpenElfSymbolsForModuleFile(reader, moduleFile);
+                        if (elfModule != null)
+                        {
+                            symbolLookup = elfModule;
+                            // ELF RVA = (address - ImageBase) + FileOffset, matching ElfSymbolModule's
+                            // (st_value - pVaddr) + pOffset formula.
+                            ulong fileOffset = moduleFile.ElfInfo.FileOffset;
+                            computeRva = (address) => checked((uint)(address - moduleFile.ImageBase) + (uint)fileOffset);
+                        }
+                    }
+                    break;
 
-                symbolLookup = moduleReader;
+                case ModuleBinaryFormat.PE:
+                    {
+                        // Try R2R perfmap first (Linux managed with precompiled code),
+                        // then fall back to PDB.
+                        R2RPerfMapSymbolModule r2rSymbolModule = OpenR2RPerfMapForModuleFile(reader, moduleFile);
+                        if (r2rSymbolModule != null)
+                        {
+                            symbolLookup = r2rSymbolModule;
+                        }
+                        else
+                        {
+                            NativeSymbolModule moduleReader = OpenPdbForModuleFile(reader, moduleFile) as NativeSymbolModule;
+                            if (moduleReader != null)
+                            {
+                                symbolLookup = moduleReader;
+                            }
+                        }
+                        // PE RVA = address - ImageBase (standard Windows convention).
+                        computeRva = (address) => (uint)(address - moduleFile.ImageBase);
+                    }
+                    break;
+
+                case ModuleBinaryFormat.Unspecified:
+                    {
+                        // For unmerged Windows traces, symbolInfo is null because the ETL
+                        // didn't contain RSDS events with PDB identity info.
+                        // Fall back to PDB lookup on Windows, which handles missing signatures
+                        // gracefully and returns null if the file isn't a PE binary.
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        {
+                            reader.m_log.WriteLine("LookupSymbolsForModule: Binary format unspecified for {0}, looking up PDB info from local file.", moduleFile.FilePath);
+                            NativeSymbolModule moduleReader = OpenPdbForModuleFile(reader, moduleFile) as NativeSymbolModule;
+                            if (moduleReader != null)
+                            {
+                                symbolLookup = moduleReader;
+                            }
+                            // Standard PE RVA computation.
+                            computeRva = (address) => (uint)(address - moduleFile.ImageBase);
+                        }
+                        else
+                        {
+                            reader.m_log.WriteLine("LookupSymbolsForModule: Binary format unspecified for {0}, skipping.", moduleFile.FilePath);
+                        }
+                    }
+                    break;
+
+                default:
+                    {
+                        Debug.Assert(false, "LookupSymbolsForModule: unrecognized binary format " + moduleFile.BinaryFormat);
+                        reader.m_log.WriteLine("LookupSymbolsForModule: Unrecognized binary format {0} for {1}, skipping.", moduleFile.BinaryFormat, moduleFile.FilePath);
+                    }
+                    break;
+            }
+
+            if (symbolLookup == null)
+            {
+                reader.m_log.WriteLine("Could not find symbols.");
+                return;
             }
 
             reader.m_log.WriteLine("Loaded, resolving symbols");
@@ -8881,7 +9038,9 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                     else
                     {
                         uint symbolStart = 0;
-                        var newMethodName = symbolLookup.FindNameForRva((uint)(address - moduleFile.ImageBase), ref symbolStart);
+                        uint rva = computeRva(address);
+
+                        var newMethodName = symbolLookup.FindNameForRva(rva, ref symbolStart);
                         if (newMethodName.Length > 0)
                         {
                             // TODO FIX NOW
@@ -8952,7 +9111,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// Look up the SymbolModule (open PDB) for a given moduleFile.   Will generate NGEN pdbs as needed.
         /// </summary>
-        private unsafe ManagedSymbolModule OpenPdbForModuleFile(SymbolReader symReader, TraceModuleFile moduleFile)
+        internal unsafe ManagedSymbolModule OpenPdbForModuleFile(SymbolReader symReader, TraceModuleFile moduleFile)
         {
             string pdbFileName = null;
             // If we have a signature, use it
@@ -8972,6 +9131,21 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 if (TraceModuleUnchanged(moduleFile, symReader.m_log))
                 {
                     pdbFileName = symReader.FindSymbolFilePathForModule(moduleFile.FilePath);
+
+                    // No standalone PDB found, but the on-disk module matches the trace.  See if the
+                    // module carries an embedded portable PDB (<DebugType>embedded</DebugType>) and use
+                    // it directly.  Because the bytes come from the matched-on-disk module, no GUID/age
+                    // re-validation is required, so we return the module immediately.
+                    if (pdbFileName == null)
+                    {
+                        ManagedSymbolModule embeddedSymbolModule = symReader.OpenEmbeddedPortablePdb(moduleFile.FilePath);
+                        if (embeddedSymbolModule != null)
+                        {
+                            embeddedSymbolModule.ExePath = moduleFile.FilePath;
+                            symReader.m_log.WriteLine("Opened embedded portable PDB for {0}", moduleFile.FilePath);
+                            return embeddedSymbolModule;
+                        }
+                    }
                 }
             }
 
@@ -9051,7 +9225,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                     var nativePdb = symbolReaderModule as NativeSymbolModule;
                     if (nativePdb != null)
                     {
-                        nativePdb.LogManagedInfo(managed.PdbName, managed.PdbSignature, managed.pdbAge);
+                        nativePdb.LogManagedInfo(managed.PdbName, managed.PdbSignature, managed.PdbAge);
                     }
                 }
             }
@@ -9065,30 +9239,72 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </summary>
         private unsafe R2RPerfMapSymbolModule OpenR2RPerfMapForModuleFile(SymbolReader symReader, TraceModuleFile moduleFile)
         {
-            // If we have a signature, use it
-            if (moduleFile.r2rPerfMapSignature != Guid.Empty)
-            {
-                string filePath = symReader.FindR2RPerfMapSymbolFilePath(moduleFile.R2RPerfMapName, moduleFile.R2RPerfMapSignature, moduleFile.R2RPerfMapVersion);
-                if (filePath != null)
-                {
-                    R2RPerfMapSymbolModule symbolModule = symReader.OpenR2RPerfMapSymbolFile(filePath, moduleFile.R2RImageTextVirtualOffset);
-                    if (symbolModule != null && symbolModule.Signature == moduleFile.R2RPerfMapSignature && symbolModule.Version == moduleFile.R2RPerfMapVersion)
-                    {
-                        return symbolModule;
-                    }
-                    else
-                    {
-                        symReader.m_log.WriteLine("ERROR: The R2R perfmap does not match the loaded module.  Actual Signature = " + symbolModule.Signature + " Requested Signature = " + moduleFile.R2RPerfMapSignature);
-                        return null;
-                    }
-                }
-            }
-            else
+            Debug.Assert(moduleFile.PEInfo != null, "OpenR2RPerfMapForModuleFile called with null PEInfo");
+            var peInfo = moduleFile.PEInfo;
+            if (peInfo == null || peInfo.R2RPerfMapSignature == Guid.Empty || string.IsNullOrEmpty(peInfo.R2RPerfMapName))
             {
                 symReader.m_log.WriteLine("No R2R perfmap signature for {0} in trace.", moduleFile.FilePath);
+                return null;
             }
 
-            return null;
+            // Find handles all search: sym server, sym path, and adjacent-to-binary (via dllFilePath).
+            string filePath = symReader.FindR2RPerfMapSymbolFilePath(peInfo.R2RPerfMapName, peInfo.R2RPerfMapSignature, peInfo.R2RPerfMapVersion, moduleFile.FilePath);
+            if (filePath == null)
+            {
+                return null;
+            }
+
+            R2RPerfMapSymbolModule symbolModule = symReader.OpenR2RPerfMapSymbolFile(filePath, peInfo.R2RImageTextVirtualOffset);
+            if (symbolModule == null)
+            {
+                return null;
+            }
+
+            // Post-open validation (belt and suspenders — Find already validated via R2RPerfMapMatches).
+            if (symbolModule.Signature != peInfo.R2RPerfMapSignature || symbolModule.Version != peInfo.R2RPerfMapVersion)
+            {
+                symReader.m_log.WriteLine("ERROR: R2R perfmap {0} does not match. Actual Signature={1} Version={2}, Expected Signature={3} Version={4}",
+                    filePath, symbolModule.Signature, symbolModule.Version, peInfo.R2RPerfMapSignature, peInfo.R2RPerfMapVersion);
+                return null;
+            }
+
+            return symbolModule;
+        }
+
+        /// <summary>
+        /// Attempts to find and open ELF debug symbols for the given module file.
+        /// Returns an ElfSymbolModule if symbols are found, null otherwise.
+        /// </summary>
+        private ElfSymbolModule OpenElfSymbolsForModuleFile(SymbolReader reader, TraceModuleFile moduleFile)
+        {
+            Debug.Assert(moduleFile.ElfInfo != null, "OpenElfSymbolsForModuleFile called with null ElfInfo");
+            var elfInfo = moduleFile.ElfInfo;
+            if (elfInfo == null || string.IsNullOrEmpty(elfInfo.BuildId))
+            {
+                return null;
+            }
+
+            ulong alignedVAddr = elfInfo.PageAlignedVirtualAddress;
+
+            // Find handles all search: sym server, sym path, and adjacent-to-binary (via elfFilePath).
+            string symbolFilePath = reader.FindElfSymbolFilePath(moduleFile.Name, elfInfo.BuildId, moduleFile.FilePath);
+            if (symbolFilePath == null)
+            {
+                reader.m_log.WriteLine("Could not find ELF symbol file for {0} (BuildId: {1})", moduleFile.Name, elfInfo.BuildId);
+                return null;
+            }
+
+            try
+            {
+                reader.m_log.WriteLine("Opening ELF symbols from {0} (pVaddr=0x{1:x}, aligned=0x{2:x}, pOffset=0x{3:x}, pageSize={4})",
+                    symbolFilePath, elfInfo.VirtualAddress, alignedVAddr, elfInfo.FileOffset, elfInfo.PageSize);
+                return reader.OpenElfSymbolFile(symbolFilePath, alignedVAddr, elfInfo.FileOffset);
+            }
+            catch (Exception e)
+            {
+                reader.m_log.WriteLine("Error opening ELF symbol file {0}: {1}", symbolFilePath, e.Message);
+                return null;
+            }
         }
 
         /// <summary>
@@ -9362,7 +9578,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 moduleFileIndex = moduleFile.ModuleFileIndex;
 
                 if (optimizationTier == Parsers.Clr.OptimizationTier.Unknown &&
-                    moduleFile.IsReadyToRun &&
+                    (moduleFile.PEInfo?.IsReadyToRun ?? false) &&
                     moduleFile.ImageBase <= Address &&
                     Address < moduleFile.ImageEnd)
                 {
@@ -10380,35 +10596,76 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// The name of the symbol file (PDB file) associated with the DLL
         /// </summary>
-        public string PdbName { get { return pdbName; } }
+        public string PdbName { get { return PEInfo?.PdbName ?? ""; } }
         /// <summary>
         /// Returns the GUID that uniquely identifies the symbol file (PDB file) for this DLL
         /// </summary>
-        public Guid PdbSignature { get { return pdbSignature; } }
+        public Guid PdbSignature { get { return PEInfo?.PdbSignature ?? Guid.Empty; } }
         /// <summary>
         /// Returns the age (which is a small integer), that is also needed to look up the symbol file (PDB file) on a symbol server.
         /// </summary>
-        public int PdbAge { get { return pdbAge; } }
+        public int PdbAge { get { return PEInfo?.PdbAge ?? 0; } }
 
         /// <summary>
-        /// Returns the GUID that uniquely identifies the R2R perfmap file for this DLL
+        /// The binary format of this module file (PE, ELF, or Unknown).
         /// </summary>
-        public Guid R2RPerfMapSignature { get { return r2rPerfMapSignature; } }
+        public ModuleBinaryFormat BinaryFormat { get { return symbolInfo?.Format ?? ModuleBinaryFormat.Unspecified; } }
 
         /// <summary>
-        /// Returns the version number of the R2R perfmap file format.
+        /// PE-specific symbol info (PDB identity + R2R). Null if this is not a PE module.
         /// </summary>
-        public int R2RPerfMapVersion { get { return r2rPerfMapVersion; } }
+        public PESymbolInfo PEInfo { get { return symbolInfo as PESymbolInfo; } }
 
         /// <summary>
-        /// Returns the name of the R2R perfmap file.
+        /// ELF-specific symbol info (BuildId + load header). Null if this is not an ELF module.
         /// </summary>
-        public string R2RPerfMapName { get { return r2rPerfMapName; } }
+        public ElfSymbolInfo ElfInfo { get { return symbolInfo as ElfSymbolInfo; } }
 
         /// <summary>
-        /// Returns the offset in bytes between the beginning of the PE image and the beginning of the text section according to the loaded layout.
+        /// Returns PESymbolInfo if this module's symbolInfo is already PE, creates one if null.
+        /// Returns null if symbolInfo is a different type (e.g. ELF) — prevents silent overwrites.
+        /// Use with pattern matching: if (moduleFile.MatchOrInitPE() is { } pe) { pe.Field = value; }
         /// </summary>
-        public uint R2RImageTextVirtualOffset { get { return r2rImageTextVirtualOffset; } }
+        internal PESymbolInfo MatchOrInitPE()
+        {
+            if (symbolInfo is PESymbolInfo pe)
+            {
+                return pe;
+            }
+
+            if (symbolInfo != null)
+            {
+                Debug.Assert(false, $"MatchOrInitPE called but symbolInfo is {symbolInfo.GetType().Name}, not PESymbolInfo. This is a bug — module metadata is being set for the wrong binary format.");
+                return null;
+            }
+
+            pe = new PESymbolInfo();
+            symbolInfo = pe;
+            return pe;
+        }
+
+        /// <summary>
+        /// Returns ElfSymbolInfo if this module's symbolInfo is already ELF, creates one if null.
+        /// Returns null if symbolInfo is a different type (e.g. PE) — prevents silent overwrites.
+        /// Use with pattern matching: if (moduleFile.MatchOrInitElf() is { } elf) { elf.Field = value; }
+        /// </summary>
+        internal ElfSymbolInfo MatchOrInitElf()
+        {
+            if (symbolInfo is ElfSymbolInfo elf)
+            {
+                return elf;
+            }
+
+            if (symbolInfo != null)
+            {
+                Debug.Assert(false, $"MatchOrInitElf called but symbolInfo is {symbolInfo.GetType().Name}, not ElfSymbolInfo. This is a bug — module metadata is being set for the wrong binary format.");
+                return null;
+            }
+
+            elf = new ElfSymbolInfo();
+            symbolInfo = elf;
+            return elf;
+        }
 
         /// <summary>
         /// Returns the file version string that is optionally embedded in the DLL's resources.   Returns the empty string if not present.
@@ -10441,7 +10698,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// Tells if the module file is ReadyToRun (the has precompiled code for some managed methods)
         /// </summary>
-        public bool IsReadyToRun { get { return isReadyToRun; } }
+        public bool IsReadyToRun { get { return PEInfo?.IsReadyToRun ?? false; } }
 
         /// <summary>
         /// If the Product Version fields has a GIT Commit Hash component, this returns it,  Otherwise it is empty.
@@ -10538,7 +10795,6 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             this.moduleFileIndex = moduleFileIndex;
             fileVersion = "";
             productVersion = "";
-            pdbName = "";
         }
 
         internal string fileName;
@@ -10546,16 +10802,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal Address imageBase;
         internal string name;
         private ModuleFileIndex moduleFileIndex;
-        internal bool isReadyToRun;
         internal TraceModuleFile next;          // Chain of modules that have the same path (But different image bases)
 
-        internal string pdbName;
-        internal Guid pdbSignature;
-        internal int pdbAge;
-        internal Guid r2rPerfMapSignature;
-        internal int r2rPerfMapVersion;
-        internal string r2rPerfMapName;
-        internal uint r2rImageTextVirtualOffset;
         internal string fileVersion;
         internal string productName;
         internal string productVersion;
@@ -10563,6 +10811,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal int imageChecksum;                  // used to validate if the local file is the same as the one from the trace.
         internal int codeAddressesInModule;
         internal TraceModuleFile managedModule;
+        internal TraceModuleFileSymbolInfo symbolInfo;
 
 
         void IFastSerializable.ToStream(Serializer serializer)
@@ -10571,13 +10820,14 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             serializer.Write(imageSize);
             serializer.WriteAddress(imageBase);
 
-            serializer.Write(pdbName);
-            serializer.Write(pdbSignature);
-            serializer.Write(pdbAge);
-            serializer.Write(r2rPerfMapSignature);
-            serializer.Write(r2rPerfMapVersion);
-            serializer.Write(r2rPerfMapName);
-            serializer.Write((int)r2rImageTextVirtualOffset);
+            // Write symbol info with format discriminator
+            byte format = (byte)(symbolInfo?.Format ?? ModuleBinaryFormat.Unspecified);
+            serializer.Write(format);
+            if (symbolInfo != null)
+            {
+                symbolInfo.ToStream(serializer);
+            }
+
             serializer.Write(fileVersion);
             serializer.Write(productVersion);
             serializer.Write(timeDateStamp);
@@ -10592,13 +10842,25 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             deserializer.Read(out imageSize);
             deserializer.ReadAddress(out imageBase);
 
-            deserializer.Read(out pdbName);
-            deserializer.Read(out pdbSignature);
-            deserializer.Read(out pdbAge);
-            deserializer.Read(out r2rPerfMapSignature);
-            deserializer.Read(out r2rPerfMapVersion);
-            deserializer.Read(out r2rPerfMapName);
-            r2rImageTextVirtualOffset = (uint)deserializer.ReadInt();
+            // Read symbol info with format discriminator
+            byte format = deserializer.ReadByte();
+            switch ((ModuleBinaryFormat)format)
+            {
+                case ModuleBinaryFormat.PE:
+                    var pe = new PESymbolInfo();
+                    pe.FromStream(deserializer);
+                    symbolInfo = pe;
+                    break;
+                case ModuleBinaryFormat.ELF:
+                    var elf = new ElfSymbolInfo();
+                    elf.FromStream(deserializer);
+                    symbolInfo = elf;
+                    break;
+                default:
+                    symbolInfo = null;
+                    break;
+            }
+
             deserializer.Read(out fileVersion);
             deserializer.Read(out productVersion);
             deserializer.Read(out timeDateStamp);
@@ -10608,6 +10870,143 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             deserializer.Read(out managedModule);
         }
         #endregion
+    }
+
+    /// <summary>
+    /// Identifies the binary format of a module file.
+    /// </summary>
+    public enum ModuleBinaryFormat : byte
+    {
+        /// <summary>The module format was not specified in the trace.</summary>
+        Unspecified = 0,
+        /// <summary>Windows Portable Executable format.</summary>
+        PE = 1,
+        /// <summary>Linux ELF (Executable and Linkable Format).</summary>
+        ELF = 2,
+    }
+
+    /// <summary>
+    /// Holds symbol identity metadata for a TraceModuleFile, discriminated by binary format.
+    /// Subclasses contain the format-specific fields needed for symbol server lookup and resolution.
+    /// </summary>
+    public abstract class TraceModuleFileSymbolInfo
+    {
+        /// <summary>The binary format this symbol info represents.</summary>
+        public abstract ModuleBinaryFormat Format { get; }
+
+        internal abstract void ToStream(Serializer serializer);
+        internal abstract void FromStream(Deserializer deserializer);
+    }
+
+    /// <summary>
+    /// Symbol info for Windows PE modules. Contains PDB identity and optional R2R perfmap info.
+    /// </summary>
+    public class PESymbolInfo : TraceModuleFileSymbolInfo
+    {
+        /// <summary>Returns ModuleBinaryFormat.PE.</summary>
+        public override ModuleBinaryFormat Format => ModuleBinaryFormat.PE;
+
+        /// <summary>The name of the PDB file associated with this module.</summary>
+        public string PdbName { get; set; } = "";
+        /// <summary>GUID that uniquely identifies the PDB file.</summary>
+        public Guid PdbSignature { get; set; }
+        /// <summary>Age (small integer) needed along with signature for symbol server lookup.</summary>
+        public int PdbAge { get; set; }
+        /// <summary>Whether this module contains ReadyToRun precompiled code.</summary>
+        public bool IsReadyToRun { get; set; }
+        /// <summary>GUID identifying the R2R perfmap file.</summary>
+        public Guid R2RPerfMapSignature { get; set; }
+        /// <summary>Version number of the R2R perfmap format.</summary>
+        public int R2RPerfMapVersion { get; set; }
+        /// <summary>Name of the R2R perfmap file.</summary>
+        public string R2RPerfMapName { get; set; }
+        /// <summary>Offset in bytes between PE image beginning and text section beginning.</summary>
+        public uint R2RImageTextVirtualOffset { get; set; }
+
+        internal override void ToStream(Serializer serializer)
+        {
+            serializer.Write(PdbName);
+            serializer.Write(PdbSignature);
+            serializer.Write(PdbAge);
+            serializer.Write(IsReadyToRun);
+            serializer.Write(R2RPerfMapSignature);
+            serializer.Write(R2RPerfMapVersion);
+            serializer.Write(R2RPerfMapName);
+            serializer.Write((int)R2RImageTextVirtualOffset);
+        }
+
+        internal override void FromStream(Deserializer deserializer)
+        {
+            deserializer.Read(out string pdbName);
+            PdbName = pdbName;
+            deserializer.Read(out Guid pdbSignature);
+            PdbSignature = pdbSignature;
+            deserializer.Read(out int pdbAge);
+            PdbAge = pdbAge;
+            IsReadyToRun = deserializer.ReadBool();
+            deserializer.Read(out Guid r2rPerfMapSignature);
+            R2RPerfMapSignature = r2rPerfMapSignature;
+            deserializer.Read(out int r2rPerfMapVersion);
+            R2RPerfMapVersion = r2rPerfMapVersion;
+            deserializer.Read(out string r2rPerfMapName);
+            R2RPerfMapName = r2rPerfMapName;
+            R2RImageTextVirtualOffset = (uint)deserializer.ReadInt();
+        }
+    }
+
+    /// <summary>
+    /// Symbol info for Linux ELF modules. Contains BuildId and load header info for symbol resolution.
+    /// </summary>
+    public class ElfSymbolInfo : TraceModuleFileSymbolInfo
+    {
+        /// <summary>Returns ModuleBinaryFormat.ELF.</summary>
+        public override ModuleBinaryFormat Format => ModuleBinaryFormat.ELF;
+
+        /// <summary>The GNU build-id of the ELF file (lowercase hex string, typically 40 chars).</summary>
+        public string BuildId { get; set; }
+        /// <summary>Virtual address of the first executable PT_LOAD segment (p_vaddr).</summary>
+        public ulong VirtualAddress { get; set; }
+        /// <summary>File offset of the first executable PT_LOAD segment (p_offset).</summary>
+        public ulong FileOffset { get; set; }
+        /// <summary>System page size from the trace header (e.g. 4096 for x86_64). 0 if not available.</summary>
+        public ulong PageSize { get; set; }
+
+        /// <summary>
+        /// Returns the page-aligned virtual address of the executable PT_LOAD segment.
+        /// This is the base address used for computing symbol RVAs, and matches the
+        /// "address - ImageBase" coordinate system: the Linux loader maps the executable
+        /// segment at PAGE_DOWN(p_vaddr) relative to the module load base.
+        /// Falls back to raw VirtualAddress if PageSize is not set.
+        /// </summary>
+        public ulong PageAlignedVirtualAddress
+        {
+            get
+            {
+                if (PageSize > 0)
+                {
+                    return VirtualAddress & ~(PageSize - 1);
+                }
+
+                return VirtualAddress;
+            }
+        }
+
+        internal override void ToStream(Serializer serializer)
+        {
+            serializer.Write(BuildId);
+            serializer.Write((long)VirtualAddress);
+            serializer.Write((long)FileOffset);
+            serializer.Write((long)PageSize);
+        }
+
+        internal override void FromStream(Deserializer deserializer)
+        {
+            deserializer.Read(out string buildId);
+            BuildId = buildId;
+            VirtualAddress = (ulong)deserializer.ReadInt64();
+            FileOffset = (ulong)deserializer.ReadInt64();
+            PageSize = (ulong)deserializer.ReadInt64();
+        }
     }
 
     /// <summary>

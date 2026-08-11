@@ -63,6 +63,7 @@ SOFTWARE.
 
     <SolidColorBrush x:Key="AlternateRowBackground" Color="#FFF2F1A4" />
     <SolidColorBrush x:Key="HelpRibbonBackground" Color="#FFE2E8F8" />
+    <SolidColorBrush x:Key="AccessibleFocusVisualBrush" Color="#FF005FB8" />
 
     <!-- Colourful theme  Colours -->
 
@@ -71,10 +72,30 @@ SOFTWARE.
     <SolidColorBrush x:Key="ControlBrightPrimaryColourBackground" Color="#FF3296FA" />
     <SolidColorBrush x:Key="ControlBrightPrimaryColourBorderBrush" Color="#FF50A4FA" />
 
+    <!-- Two-pixel keyboard focus visual for surfaces that require enhanced visibility. -->
+    <Style x:Key="AccessibleFocusVisual">
+        <Setter Property="Control.Template">
+            <Setter.Value>
+                <ControlTemplate>
+                    <Rectangle Margin="1"
+                               SnapsToDevicePixels="true"
+                               Stroke="{StaticResource AccessibleFocusVisualBrush}"
+                               StrokeThickness="2" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- Custom Window style (unaffected by win32 style stuff) -->
     <Style x:Key="CustomWindowStyle" TargetType="{x:Type Window}">
         <!-- Better for rendering small text -->
         <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
+    </Style>
+
+    <Style x:Key="CustomToolWindowStyle" TargetType="{x:Type Window}">
+        <!--<Setter Property="BorderThickness" Value="1" />-->
+        <Setter Property="ResizeMode" Value="NoResize" />
+        <Setter Property="WindowStyle" Value="SingleBorderWindow" />
     </Style>
 
     <!-- Custom MenuItem style which resolves color contrast issue with menu border brushes -->

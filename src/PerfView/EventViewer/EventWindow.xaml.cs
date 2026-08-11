@@ -57,6 +57,12 @@ namespace PerfView
             {
                 selection.Add(item);
             }
+            
+            // Copy timestamp column visibility settings from template
+            ShowTimeStampColumnsMenuItem.IsChecked = template.ShowTimeStampColumnsMenuItem.IsChecked;
+            ShowLocalTimeMenuItem.IsChecked = template.ShowLocalTimeMenuItem.IsChecked;
+            ShowLocalTimeMenuItem.IsEnabled = template.ShowLocalTimeMenuItem.IsEnabled;
+            
             Update();
         }
         public EventWindow(Window parent, PerfViewEventSource data)
@@ -167,6 +173,26 @@ namespace PerfView
             };
 
             MultiLineViewPaneHidden = (App.UserConfigData["MultiLineViewPaneHidden"] == "true");
+            
+            // Initialize timestamp column visibility based on user preference
+            bool showTimeStampColumns = App.UserConfigData["EventWindowShowTimeStampColumns"] != "false"; // Default to true
+            ShowTimeStampColumnsMenuItem.IsChecked = showTimeStampColumns;
+            if (!showTimeStampColumns)
+            {
+                // Hide both timestamp columns and disable the timezone menu
+                foreach (var column in Grid.Columns)
+                {
+                    if (column == OriginTimeStampColumn || column == LocalTimeStampColumn)
+                    {
+                        column.Visibility = Visibility.Hidden;
+                    }
+                }
+                ShowLocalTimeMenuItem.IsEnabled = false;
+            }
+            else
+            {
+                ShowLocalTimeMenuItem.IsEnabled = true;
+            }
         }
 
         public PerfViewEventSource DataSource { get; private set; }
@@ -1889,36 +1915,133 @@ namespace PerfView
         private List<DataGridColumn> m_userDefinedColumns;
         private float[] m_buckets;                              // Keep track of the counts of events.
         private double m_bucketTimeMSec;                        // Size for each bucket
+        private ScrollViewer m_gridScrollViewer;                // Cached ScrollViewer for horizontal scrolling
         #endregion
 
         private void DoUseLocalTime(object sender, RoutedEventArgs e)
         {
-            foreach (var i in Grid.Columns)
+            // Only change visibility if timestamp columns are enabled
+            if (ShowTimeStampColumnsMenuItem.IsChecked)
             {
-                if (i == OriginTimeStampColumn)
+                foreach (var i in Grid.Columns)
                 {
-                    i.Visibility = Visibility.Hidden;
-                }
-                else if (i == LocalTimeStampColumn)
-                {
-                    i.Visibility = Visibility.Visible;
+                    if (i == OriginTimeStampColumn)
+                    {
+                        i.Visibility = Visibility.Hidden;
+                    }
+                    else if (i == LocalTimeStampColumn)
+                    {
+                        i.Visibility = Visibility.Visible;
+                    }
                 }
             }
         }
 
         private void DoUseOriginTime(object sender, RoutedEventArgs e)
         {
+            // Only change visibility if timestamp columns are enabled
+            if (ShowTimeStampColumnsMenuItem.IsChecked)
+            {
+                foreach (var i in Grid.Columns)
+                {
+                    if (i == OriginTimeStampColumn)
+                    {
+                        i.Visibility = Visibility.Visible;
+                    }
+                    else if (i == LocalTimeStampColumn)
+                    {
+                        i.Visibility = Visibility.Hidden;
+                    }
+                }
+            }
+        }
+
+        private void DoShowTimeStampColumns(object sender, RoutedEventArgs e)
+        {
+            // Check if UI elements are initialized to avoid null reference during XAML construction
+            if (ShowLocalTimeMenuItem == null || Grid?.Columns == null)
+                return;
+                
+            // Show the appropriate timestamp column based on current preference
+            bool useLocalTime = ShowLocalTimeMenuItem.IsChecked;
             foreach (var i in Grid.Columns)
             {
                 if (i == OriginTimeStampColumn)
                 {
-                    i.Visibility = Visibility.Visible;
+                    i.Visibility = useLocalTime ? Visibility.Hidden : Visibility.Visible;
                 }
                 else if (i == LocalTimeStampColumn)
+                {
+                    i.Visibility = useLocalTime ? Visibility.Visible : Visibility.Hidden;
+                }
+            }
+            // Enable the Show Local Time menu item
+            ShowLocalTimeMenuItem.IsEnabled = true;
+            
+            // Save preference
+            App.UserConfigData["EventWindowShowTimeStampColumns"] = "true";
+        }
+
+        private void DoHideTimeStampColumns(object sender, RoutedEventArgs e)
+        {
+            // Check if UI elements are initialized to avoid null reference during XAML construction
+            if (ShowLocalTimeMenuItem == null || Grid?.Columns == null)
+                return;
+                
+            // Hide both timestamp columns
+            foreach (var i in Grid.Columns)
+            {
+                if (i == OriginTimeStampColumn || i == LocalTimeStampColumn)
                 {
                     i.Visibility = Visibility.Hidden;
                 }
             }
+            // Gray out (disable) the Show Local Time menu item
+            ShowLocalTimeMenuItem.IsEnabled = false;
+            
+            // Save preference
+            App.UserConfigData["EventWindowShowTimeStampColumns"] = "false";
+        }
+
+        /// <summary>
+        /// When Shift is held, redirect mouse wheel events to horizontal scrolling.
+        /// </summary>
+        private void Grid_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (Keyboard.Modifiers == ModifierKeys.Shift)
+            {
+                // Cache the ScrollViewer on first use
+                if (m_gridScrollViewer == null)
+                {
+                    m_gridScrollViewer = FindVisualChild<ScrollViewer>((DependencyObject)sender);
+                    if (m_gridScrollViewer == null)
+                    {
+                        return;
+                    }
+                }
+
+                m_gridScrollViewer.ScrollToHorizontalOffset(m_gridScrollViewer.HorizontalOffset - e.Delta);
+                e.Handled = true;
+            }
+        }
+
+        private static T FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(parent, i);
+                if (child is T found)
+                {
+                    return found;
+                }
+
+                T result = FindVisualChild<T>(child);
+                if (result != null)
+                {
+                    return result;
+                }
+            }
+            return null;
         }
     }
 }

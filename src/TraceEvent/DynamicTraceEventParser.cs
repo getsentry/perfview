@@ -1,8 +1,9 @@
 //     Copyright (c) Microsoft Corporation.  All rights reserved.
 using FastSerialization;
-using Microsoft.Diagnostics.Tracing.Compatibility;
+
 using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Utilities;
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -11,6 +12,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
+
 using Address = System.UInt64;
 
 namespace Microsoft.Diagnostics.Tracing.Parsers
@@ -114,14 +116,40 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
         /// </summary>
         public void WriteAllManifests(string directoryPath)
         {
-            Directory.CreateDirectory(directoryPath);
+            string fullDirectoryPath = Path.GetFullPath(directoryPath);
+            Directory.CreateDirectory(fullDirectoryPath);
             foreach (var providerManifest in DynamicProviders)
             {
-                
-                var filePath = Path.Combine(directoryPath, providerManifest.Name + ".manifest.xml");
+                // Provider names come from <provider name="..."> attributes in untrusted
+                // manifest XML embedded in trace data.  Sanitize the name into a safe
+                // file-name component; if the sanitizer rejects the input outright,
+                // fall back to the provider's GUID (which is always well-formed for a
+                // non-Guid.Empty value) so distinct providers still get distinct
+                // manifest files.  Use "_" only as a last resort when neither the
+                // name nor the GUID is usable.
+                string sanitizedName = PathUtilities.SanitizeFileName(providerManifest.Name);
+                if (sanitizedName == null)
+                {
+                    sanitizedName = providerManifest.Guid != Guid.Empty
+                        ? providerManifest.Guid.ToString("N")
+                        : "_";
+                }
+                string fileName = sanitizedName + ".manifest.xml";
+                string filePath = Path.GetFullPath(Path.Combine(fullDirectoryPath, fileName));
+
+                // SanitizeFileName strips every path separator and other invalid
+                // file-name character, so the combined path cannot escape the requested
+                // directory.  Verify that invariant defensively in case the sanitizer
+                // ever regresses or Path.Combine behaves unexpectedly on a new runtime.
+                if (!PathUtilities.IsPathWithinDirectory(filePath, fullDirectoryPath))
+                {
+                    throw new InvalidOperationException("Manifest output path must remain within the requested directory.");
+                }
+
                 providerManifest.WriteToFile(filePath);
             }
         }
+
 
         /// <summary>
         /// Utility method that read all the manifests the directory 'directoryPath' into the parser.   
@@ -279,8 +307,16 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             // also enumerate any events from the registeredParser.  
             registeredParser.EnumerateTemplates(eventsToObserve, callback);
 
-            // also enumerate any events from the eventPipeTraceEventParser
-            eventPipeTraceEventParser.EnumerateTemplates(eventsToObserve, callback);
+            // also enumerate any events from the eventPipeTraceEventParser.
+            // Filter out any duplicates that the registeredParser already knows about,
+            // similar to how manifest-based templates are filtered above.
+            eventPipeTraceEventParser.EnumerateTemplates(eventsToObserve, delegate (TraceEvent template)
+            {
+                if (!registeredParser.HasDefinitionForTemplate(template))
+                {
+                    callback(template);
+                }
+            });
         }
 
         private class PartialManifestInfo
@@ -487,7 +523,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             PayloadFetchClassInfo classInfo = payloadFetch.Class;
             if (classInfo != null)
             {
-                var ret = new StructValue(classInfo.FieldFetches.Length);
+                var ret = new StructValue(classInfo.FieldFetches);
 
                 for (int i = 0; i < classInfo.FieldFetches.Length; i++)
                 {
@@ -529,7 +565,15 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 for (int i = 0; i < arrayCount; i++)
                 {
                     object value = GetPayloadValueAt(ref arrayInfo.Element, offset, payloadLength);
-                    if (value.GetType() != elementType)
+                    // Some events have metadata of the form:
+                    // input=Array of ulong
+                    // output=Array of IntPtr
+                    // This is common for bitmasks.  To address this, we special case it here.
+                    if (elementType == typeof(IntPtr) && value is ulong uintVal)
+                    {
+                        value = new IntPtr(unchecked((long)uintVal));
+                    }
+                    else if (value.GetType() != elementType)
                     {
                         value = ((IConvertible)value).ToType(elementType, null);
                     }
@@ -589,6 +633,15 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                             else if (IsCountedSize(size))
                             {
                                 bool unicodeByteCountString = !isAnsi && (size & ELEM_COUNT) == 0;
+                                // The length-prefix bytes are read from the payload via GetInt16At / GetInt32At,
+                                // which do not bounds check.  Validate that the prefix itself is inside the payload
+                                // before reading it, so a crafted offset near EventDataLength cannot pull bytes
+                                // from adjacent native memory into 'size'.
+                                int prefixBytes = ((size & BIT_32) != 0) ? 4 : 2;
+                                if (offset < 0 || EventDataLength - offset < prefixBytes)
+                                {
+                                    throw new ArgumentOutOfRangeException(nameof(size));
+                                }
                                 if (((size & BIT_32) != 0))
                                 {
                                     size = (ushort)GetInt32At(offset);
@@ -613,6 +666,16 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                         {
                             size -= 0x8000;
                             isAnsi = true;
+                        }
+                        // Bounds-check before reading the fixed/counted string.  For counted strings 'size' was just
+                        // read from the payload bytes, so we must ensure the read stays inside EventDataLength to
+                        // avoid an out-of-bounds read of native heap memory.  ANSI strings use 'size' bytes; Unicode
+                        // strings use 'size * 2' bytes.  We compute the required byte count using long arithmetic to
+                        // avoid any chance of overflow before the comparison.
+                        long bytesNeeded = isAnsi ? (long)size : (long)size * 2;
+                        if (offset < 0 || EventDataLength - offset < bytesNeeded)
+                        {
+                            throw new ArgumentOutOfRangeException(nameof(size));
                         }
                         if (isAnsi)
                         {
@@ -719,9 +782,10 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
         /// </summary>
         internal class StructValue : IDictionary<string, object>
         {
-            internal StructValue(int capacity = 0)
+            internal StructValue(PayloadFetch[] fieldFetches)
             {
-                m_values = new List<KeyValuePair<string, object>>(capacity);
+                m_fieldFetches = fieldFetches ?? throw new ArgumentNullException(nameof(fieldFetches));
+                m_values = new List<KeyValuePair<string, object>>(fieldFetches.Length);
             }
             public IEnumerator<KeyValuePair<string, object>> GetEnumerator() { return m_values.GetEnumerator(); }
             System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() { return m_values.GetEnumerator(); }
@@ -764,71 +828,94 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 return WriteAsJSon(new StringBuilder(), this).ToString();
             }
 
-            private static StringBuilder WriteAsJSon(StringBuilder sb, object value)
+            private static StringBuilder WriteAsJSon(StringBuilder sb, StructValue value)
             {
-                var asStructValue = value as StructValue;
-                if (asStructValue != null)
+                Debug.Assert(value.m_values.Count == value.m_fieldFetches.Length);
+                sb.Append("{ ");
+                bool first = true;
+                for (int i = 0; i < value.m_values.Count; i++)
                 {
-                    sb.Append("{ ");
-                    bool first = true;
-                    foreach (var keyvalue in asStructValue)
+                    if (!first)
                     {
-                        if (!first)
-                        {
-                            sb.Append(", ");
-                        }
-                        else
-                        {
-                            first = false;
-                        }
-
-                        sb.Append("\"");
-                        Quote(sb, keyvalue.Key);
-                        sb.Append("\":");
-                        WriteAsJSon(sb, keyvalue.Value);
+                        sb.Append(", ");
                     }
-                    sb.Append(" }");
-                    return sb;
-                }
-
-                var asArray = value as System.Array;
-                if (asArray != null && asArray.Rank == 1)
-                {
-                    sb.Append("[ ");
-                    bool first = true;
-                    for (int i = 0; i < asArray.Length; i++)
+                    else
                     {
-                        if (!first)
-                        {
-                            sb.Append(", ");
-                        }
-                        else
-                        {
-                            first = false;
-                        }
-
-                        WriteAsJSon(sb, asArray.GetValue(i));
+                        first = false;
                     }
-                    sb.Append(" ]");
-                    return sb;
-                }
 
-                if (value is int || value is bool || value is double || value is float)
-                {
-                    sb.Append(value);
-                    return sb;
-                }
-                else if (value == null)
-                {
-                    sb.Append("null");
-                }
-                else
-                {
+                    KeyValuePair<string, object> keyvalue = value.m_values[i];
                     sb.Append("\"");
-                    Quote(sb, value.ToString());
-                    sb.Append("\"");
+                    Quote(sb, keyvalue.Key);
+                    sb.Append("\":");
+                    AppendField(sb, keyvalue.Value, value.m_fieldFetches[i]);
                 }
+                sb.Append(" }");
                 return sb;
+
+                static void AppendField(StringBuilder sb, object value, PayloadFetch payloadFetch)
+                {
+                    var asStructValue = value as StructValue;
+                    if (asStructValue != null)
+                    {
+                        WriteAsJSon(sb, asStructValue);
+                        return;
+                    }
+
+                    if (payloadFetch.FormatHint != TdhFormatter.FormatHint.None)
+                    {
+                        string formatted = TdhFormatter.Format(value, payloadFetch.FormatHint);
+                        if (formatted != null)
+                        {
+                            sb.Append("\"");
+                            Quote(sb, formatted);
+                            sb.Append("\"");
+                            return;
+                        }
+                    }
+
+                    var asArray = value as System.Array;
+                    if (asArray != null && asArray.Rank == 1)
+                    {
+                        PayloadFetchArrayInfo arrayInfo = payloadFetch.Array;
+                        if (arrayInfo == null)
+                        {
+                            throw new InvalidOperationException("Array value requires array payload metadata.");
+                        }
+
+                        sb.Append("[ ");
+                        bool first = true;
+                        for (int i = 0; i < asArray.Length; i++)
+                        {
+                            if (!first)
+                            {
+                                sb.Append(", ");
+                            }
+                            else
+                            {
+                                first = false;
+                            }
+
+                            AppendField(sb, asArray.GetValue(i), arrayInfo.Element);
+                        }
+                        sb.Append(" ]");
+
+                    }
+                    else if (value is int || value is bool || value is double || value is float)
+                    {
+                        sb.Append(value);
+                    }
+                    else if (value == null)
+                    {
+                        sb.Append("null");
+                    }
+                    else
+                    {
+                        sb.Append("\"");
+                        Quote(sb, value.ToString());
+                        sb.Append("\"");
+                    }
+                }
             }
 
             #region private
@@ -863,7 +950,8 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             public void CopyTo(KeyValuePair<string, object>[] array, int arrayIndex) { throw new NotImplementedException(); }
             public bool Remove(KeyValuePair<string, object> item) { throw new NotImplementedException(); }
 
-            private List<KeyValuePair<string, object>> m_values;
+            private readonly PayloadFetch[] m_fieldFetches;
+            private readonly List<KeyValuePair<string, object>> m_values;
             #endregion
         }
 
@@ -885,7 +973,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
         /// </summary>
         public override string PayloadString(int index, IFormatProvider formatProvider = null)
         {
-            // See if you can do enumeration mapping.  
+            // See if you can do enumeration mapping.
             var map = payloadFetches[index].Map;
             if (map != null)
             {
@@ -953,9 +1041,42 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 }
             }
 
-            // Otherwise do the default transformations. 
+            // Otherwise apply any TraceLogging formatting hints
+            string hinted = FormatWithHint(index, formatProvider);
+            if (hinted != null)
+            {
+                return hinted;
+            }
+
+            // Otherwise do the default transformations.
             return base.PayloadString(index, formatProvider);
         }
+
+        /// <summary>
+        /// Applies the field's <see cref="TdhFormatter.FormatHint"/> hint to the value at <paramref
+        /// name="index"/>. Returns the formatted string, or null if no hint applies.
+        /// </summary>
+        private string FormatWithHint(int index, IFormatProvider formatProvider)
+        {
+            TdhFormatter.FormatHint format = payloadFetches[index].FormatHint;
+
+            // For arrays the hint lives on the element, not on the array itself.
+            TdhFormatter.FormatHint? elementFormat = null;
+            if (format == TdhFormatter.FormatHint.None)
+            {
+                elementFormat = payloadFetches[index].Array?.Element.FormatHint;
+            }
+
+            // If no hint applies, don't fetch the value to just ignore it.
+            if (format == TdhFormatter.FormatHint.None && elementFormat.GetValueOrDefault(TdhFormatter.FormatHint.None) == TdhFormatter.FormatHint.None)
+            {
+                return null;
+            }
+
+            object value = PayloadValue(index);
+            return TdhFormatter.Format(value, format, elementFormat, formatProvider);
+        }
+
         /// <summary>
         /// Implements TraceEvent interface
         /// </summary>
@@ -1124,6 +1245,15 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 Debug.Assert(IsCountedSize(payloadFetch.Size));
 
                 // Length prefixed arrays have a 2 or 4 byte length field.
+                int lengthFieldSize = ((payloadFetch.Size & DynamicTraceEventData.BIT_32) != 0) ? 4 : 2;
+                // GetInt16At / GetInt32At are raw memory reads that do not bounds check, so
+                // validate the length-field bytes are inside EventDataLength before reading them.
+                // Without this, a payload with fewer than 'lengthFieldSize' bytes at 'offset' would
+                // surface adjacent native heap bytes as the array count.
+                if (offset < 0 || EventDataLength - offset < lengthFieldSize)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                }
                 if (((payloadFetch.Size & DynamicTraceEventData.BIT_32) != 0))
                 {
                     arrayCount = GetInt32At(offset);
@@ -1134,20 +1264,25 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     arrayCount = GetInt16At(offset);
                     offset += 2;
                 }
+
+                // The length field is read directly from the payload bytes,
+                // so validate it against EventDataLength before the caller uses it to read array elements.
+                // For fixed-size elements we can compute the exact byte cost; for variable-sized elements
+                // we use a per-element minimum derived from the element encoding (e.g. 2 bytes for UTF-16
+                // null-terminated strings) which still gives a useful upper bound that prevents OOB reads.
+                ValidateArrayCount(arrayInfo, offset, arrayCount);
             }
             else if (arrayInfo.Kind == ArrayKind.RelLoc)
             {
                 Debug.Assert(arrayInfo.Element.IsFixedSize);
 
-                arrayCount = GetInt16At(offset + 2) / arrayInfo.Element.Size;
-                offset = GetInt16At(offset) + offset + 4; // RelLoc offset is relative to the end of the field.
+                (offset, arrayCount) = GetArrayDataOffsetAndCount(arrayInfo, offset, isRelLoc: true);
             }
             else if (arrayInfo.Kind == ArrayKind.DataLoc)
             {
                 Debug.Assert(arrayInfo.Element.IsFixedSize);
 
-                arrayCount = GetInt16At(offset + 2) / arrayInfo.Element.Size;
-                offset = GetInt16At(offset); // DataLoc offset is absolute in the buffer
+                (offset, arrayCount) = GetArrayDataOffsetAndCount(arrayInfo, offset, isRelLoc: false);
             }
             else
             {
@@ -1156,6 +1291,98 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
 
             return arrayCount;
+        }
+
+        private (int dataOffset, int arrayCount) GetArrayDataOffsetAndCount(PayloadFetchArrayInfo arrayInfo, int offset, bool isRelLoc)
+        {
+            const int locDescriptorSize = 4;
+
+            if (offset < 0 || EventDataLength - locDescriptorSize < offset)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset));
+            }
+
+            int arrayOffset = (ushort)GetInt16At(offset);
+            int arrayByteLength = (ushort)GetInt16At(offset + 2);
+            int elementSize = arrayInfo.Element.Size;
+            if (elementSize <= 0 || arrayByteLength % elementSize != 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayByteLength));
+            }
+
+            int dataOffset = arrayOffset;
+            if (isRelLoc)
+            {
+                int relativeOffsetBase = offset + locDescriptorSize;
+                if (relativeOffsetBase < offset || int.MaxValue - relativeOffsetBase < arrayOffset)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                }
+
+                dataOffset = relativeOffsetBase + arrayOffset; // RelLoc offset is relative to the end of the RelLoc field itself.
+            }
+
+            if (dataOffset < 0 || EventDataLength - dataOffset < arrayByteLength)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayByteLength));
+            }
+
+            return (dataOffset, arrayByteLength / elementSize);
+        }
+
+        // Validates that 'arrayCount' (just read from payload bytes for a length-prefixed
+        // array) does not point past the end of the event payload.  For fixed-size elements we use the actual
+        // element size; for variable-sized elements we use a per-element minimum derived from the element
+        // encoding (e.g. 2 bytes for UTF-16 null-terminated strings) so that callers that fast-path byte /
+        // char arrays via GetByteArrayAt or GetFixed*StringAt cannot be tricked into an OOB read.
+        private void ValidateArrayCount(PayloadFetchArrayInfo arrayInfo, int offset, int arrayCount)
+        {
+            if (arrayCount < 0 || offset < 0 || offset > EventDataLength)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayCount));
+            }
+
+            int remaining = EventDataLength - offset;
+            long minBytesNeeded;
+            if (arrayInfo.Element.IsFixedSize)
+            {
+                int elementSize = arrayInfo.Element.Size;
+                if (elementSize <= 0)
+                {
+                    // Defensive: a zero-sized element with an unbounded count makes no sense.
+                    throw new ArgumentOutOfRangeException(nameof(arrayCount));
+                }
+                minBytesNeeded = (long)arrayCount * elementSize;
+            }
+            else
+            {
+                // Variable-sized elements still have a minimum byte footprint per element.
+                // For strings, the minimum depends on encoding:
+                //   - null-terminated Unicode strings need at least 2 bytes (the terminator),
+                //   - counted strings need at least the size prefix (2 or 4 bytes),
+                //   - null-terminated ANSI strings need at least 1 byte (the terminator).
+                // For any other variable-sized element kind we conservatively assume 1 byte.
+                int minBytesPerElement = 1;
+                if (arrayInfo.Element.Type == typeof(string))
+                {
+                    ushort elementSize = arrayInfo.Element.Size;
+                    if (IsNullTerminated(elementSize))
+                    {
+                        bool isAnsi = (elementSize & IS_ANSI) != 0;
+                        minBytesPerElement = isAnsi ? 1 : 2;
+                    }
+                    else if (IsCountedSize(elementSize))
+                    {
+                        minBytesPerElement = ((elementSize & BIT_32) != 0) ? 4 : 2;
+                    }
+                }
+                minBytesNeeded = (long)arrayCount * minBytesPerElement;
+            }
+
+            if (minBytesNeeded > remaining)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayCount));
+            }
         }
 
         internal int OffsetOfNextField(ref PayloadFetch payloadFetch, int offset, int payloadLength)
@@ -1316,6 +1543,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 Size = size;
                 Type = type;
                 info = map;
+                FormatHint = TdhFormatter.FormatHint.None;
             }
 
             /// <summary>
@@ -1323,10 +1551,11 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             /// if the type is unknown.  
             /// </summary>
 
-            public PayloadFetch(ushort offset, RegisteredTraceEventParser.TdhInputType inType, int outType)
+            public PayloadFetch(ushort offset, RegisteredTraceEventParser.TdhInputType inType, RegisteredTraceEventParser.TdhOutputType outType)
             {
                 Offset = offset;
                 info = null;
+                FormatHint = ComputeFormatHintFromInOutTypes(inType, outType);
 
                 switch (inType)
                 {
@@ -1339,7 +1568,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                         Size = DynamicTraceEventData.NULL_TERMINATED | DynamicTraceEventData.IS_ANSI;
                         break;
                     case RegisteredTraceEventParser.TdhInputType.UInt8:
-                        if (outType == 13)       // Encoding for boolean
+                        if (outType == RegisteredTraceEventParser.TdhOutputType.Boolean)
                         {
                             Type = typeof(bool);
                             Size = 1;
@@ -1355,7 +1584,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     case RegisteredTraceEventParser.TdhInputType.Int16:
                     case RegisteredTraceEventParser.TdhInputType.UInt16:
                         Size = 2;
-                        if (outType == 1)       // Encoding for String
+                        if (outType == RegisteredTraceEventParser.TdhOutputType.String)
                         {
                             Type = typeof(char);
                             break;
@@ -1427,6 +1656,62 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             private static bool ArrayElementCanProjectToString(PayloadFetch element)
             {
                 return element.Type == typeof(char) && (element.Size == 1 || element.Size == 2);
+            }
+
+            /// <summary>
+            /// Maps a TraceLogging field's <see cref="RegisteredTraceEventParser.TdhInputType"/>
+            /// and <see cref="RegisteredTraceEventParser.TdhOutputType"/> values to a <see
+            /// cref="TdhFormatter.FormatHint"/> hint.
+            /// </summary>
+            /// <remarks>
+            /// This method doesn't validate that <paramref name="inType"/> can be rendered as the
+            /// requested <paramref name="outType"/>. Instead, formatting code handles those cases,
+            /// typically by returning null so that fallback formatting will run.
+            /// </remarks>
+            internal static TdhFormatter.FormatHint ComputeFormatHintFromInOutTypes(RegisteredTraceEventParser.TdhInputType inType, RegisteredTraceEventParser.TdhOutputType outType)
+            {
+                switch (outType)
+                {
+                    case RegisteredTraceEventParser.TdhOutputType.HexInt8:
+                    case RegisteredTraceEventParser.TdhOutputType.HexInt16:
+                    case RegisteredTraceEventParser.TdhOutputType.HexInt32:
+                    case RegisteredTraceEventParser.TdhOutputType.HexInt64:
+                        // Use pointer formatting for hex types, even if the output type is different.
+                        // This maintains compatibility with the existing formatting logic.
+                        return inType == RegisteredTraceEventParser.TdhInputType.Pointer ? TdhFormatter.FormatHint.Pointer : TdhFormatter.FormatHint.Hex;
+                    case RegisteredTraceEventParser.TdhOutputType.Pid:
+                        return TdhFormatter.FormatHint.Pid;
+                    case RegisteredTraceEventParser.TdhOutputType.Tid:
+                        return TdhFormatter.FormatHint.Tid;
+                    case RegisteredTraceEventParser.TdhOutputType.Port:
+                        return TdhFormatter.FormatHint.Port;
+                    case RegisteredTraceEventParser.TdhOutputType.Ipv4:
+                        return TdhFormatter.FormatHint.IPv4;
+                    case RegisteredTraceEventParser.TdhOutputType.Ipv6:
+                        return TdhFormatter.FormatHint.IPv6;
+                    case RegisteredTraceEventParser.TdhOutputType.SocketAddress:
+                        return TdhFormatter.FormatHint.SocketAddress;
+                    case RegisteredTraceEventParser.TdhOutputType.ErrorCode:
+                        return TdhFormatter.FormatHint.GenericError;
+                    case RegisteredTraceEventParser.TdhOutputType.Win32Error:
+                        return TdhFormatter.FormatHint.Win32Error;
+                    case RegisteredTraceEventParser.TdhOutputType.NtStatus:
+                        return TdhFormatter.FormatHint.NtStatus;
+                    case RegisteredTraceEventParser.TdhOutputType.HResult:
+                        return TdhFormatter.FormatHint.HResult;
+                    case RegisteredTraceEventParser.TdhOutputType.CodePointer:
+                        return TdhFormatter.FormatHint.Pointer;
+                }
+
+                // Some input types imply a format, so check those after checking outType.
+                switch (inType)
+                {
+                    case RegisteredTraceEventParser.TdhInputType.HexInt32:
+                    case RegisteredTraceEventParser.TdhInputType.HexInt64:
+                        return TdhFormatter.FormatHint.Hex;
+                }
+
+                return TdhFormatter.FormatHint.None;
             }
 
             /// <summary>
@@ -1567,6 +1852,9 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
             public Type Type;       // Currently null for arrays.  
 
+            // Display-formatting hint derived from the TraceLogging/TDH InType/OutType.
+            public TdhFormatter.FormatHint FormatHint { get; set; }
+
             // Non null of 'Type' is a enum
             public IDictionary<long, string> Map
             {
@@ -1651,6 +1939,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             {
                 serializer.Write((short)Offset);
                 serializer.Write((short)Size);
+                serializer.Write((byte)FormatHint);
                 if (Type == null)
                 {
                     serializer.Write((string)null);
@@ -1714,6 +2003,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             {
                 Offset = (ushort)deserializer.ReadInt16();
                 Size = (ushort)deserializer.ReadInt16();
+                FormatHint = (TdhFormatter.FormatHint)deserializer.ReadByte();
                 var typeName = deserializer.ReadString();
                 if (typeName != null)
                 {

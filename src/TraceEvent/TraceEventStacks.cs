@@ -662,6 +662,35 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                     return true;
                 }
 
+                // On Linux, threads start from libc's __clone3, __clone, or __libc_start_main.
+                // Match libc.so.6, libc.so, libc-2.31.so, etc.
+                string moduleFileName = moduleFile.Name;
+                if (string.Compare(moduleFileName, "libc", StringComparison.OrdinalIgnoreCase) == 0 ||
+                    moduleFileName.StartsWith("libc.", StringComparison.OrdinalIgnoreCase) ||
+                    moduleFileName.StartsWith("libc-", StringComparison.OrdinalIgnoreCase))
+                {
+                    m_goodTopModuleIndex = moduleFileIndex;
+                    return true;
+                }
+
+                // On musl-based Linux distros (e.g. Alpine), libc and the dynamic loader are
+                // combined into a single module named like "ld-musl-x86_64.so.1" (the architecture
+                // varies). Threads start from there (__libc_start_main, pthread start), so treat it
+                // as a valid top frame just like glibc's libc.
+                if (moduleFileName.StartsWith("ld-musl-", StringComparison.OrdinalIgnoreCase))
+                {
+                    m_goodTopModuleIndex = moduleFileIndex;
+                    return true;
+                }
+
+                // On Linux, <processName>!_start is an ELF entry point for C programs.
+                string processName = m_log.Threads[threadIndex].Process.Name;
+                if (string.Compare(moduleFileName, processName, StringComparison.OrdinalIgnoreCase) == 0)
+                {
+                    m_goodTopModuleIndex = moduleFileIndex;
+                    return true;
+                }
+
                 // The special processes 4 (System) and 0 (Kernel) can stay in the kernel without being broken.  
                 if (moduleFile.FilePath.EndsWith("ntoskrnl.exe", StringComparison.OrdinalIgnoreCase))
                 {
@@ -873,7 +902,13 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                     var bangIdx = frameName.IndexOf('!');
                     if (0 < bangIdx)
                     {
-                        if (!(5 <= bangIdx && string.Compare(frameName, bangIdx - 5, "ntdll", 0, 5, StringComparison.OrdinalIgnoreCase) == 0))
+                        // Allow ntdll (Windows) and libc (Linux: libc.so.6, libc-2.31.so, etc.) as valid thread roots.
+                        bool isNtdll = 5 <= bangIdx && string.Compare(frameName, bangIdx - 5, "ntdll", 0, 5, StringComparison.OrdinalIgnoreCase) == 0;
+                        // Match libc, libc.so, libc.so.6, libc-2.31.so, but not libcrypto etc.
+                        bool isLibc = 4 <= bangIdx &&
+                            string.Compare(frameName, 0, "libc", 0, 4, StringComparison.OrdinalIgnoreCase) == 0 &&
+                            (bangIdx == 4 || frameName[4] == '.' || frameName[4] == '-');
+                        if (!isNtdll && !isLibc)
                         {
                             var brokenFrame = m_Interner.FrameIntern("BROKEN", m_emptyModuleIdx);
                             callerIdx = m_Interner.CallStackIntern(brokenFrame, callerIdx);

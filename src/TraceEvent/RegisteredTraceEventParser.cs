@@ -8,7 +8,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Xml;
 
 namespace Microsoft.Diagnostics.Tracing.Parsers
 {
@@ -30,13 +32,16 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
             symbolSource.MetaDataEventInfo += delegate (EmptyTraceData data)
             {
-                DynamicTraceEventData template = (new RegisteredTraceEventParser.TdhEventParser((byte*)data.userData, null, MapTable)).ParseEventMetaData();
+                DynamicTraceEventData template = (new RegisteredTraceEventParser.TdhEventParser((byte*)data.userData, data.EventDataLength, null, MapTable)).ParseEventMetaData();
 
                 // Uncomment this if you want to see the template in the debugger at this point
                 // template.source = data.source;
                 // template.eventRecord = data.eventRecord;
                 // template.userData = data.userData;  
-                m_state.m_templates[template] = template;
+                if (template != null)
+                {
+                    m_state.m_templates[template] = template;
+                }
             };
 
             // Try to parse bitmap and value map information.  
@@ -44,14 +49,18 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             {
                 try
                 {
-                    Guid providerID = *((Guid*)data.userData);
-                    byte* eventInfoBuffer = (byte*)(data.userData + sizeof(Guid));
-                    RegisteredTraceEventParser.EVENT_MAP_INFO* eventInfo = (RegisteredTraceEventParser.EVENT_MAP_INFO*)eventInfoBuffer;
-                    IDictionary<long, string> map = RegisteredTraceEventParser.TdhEventParser.ParseMap(eventInfo, eventInfoBuffer);
-                    if (eventInfo->NameOffset < data.EventDataLength - 16)
+                    if (data.EventDataLength >= sizeof(Guid))
                     {
-                        string mapName = new string((char*)(&eventInfoBuffer[eventInfo->NameOffset]));
-                        MapTable.Add(new MapKey(providerID, mapName), map);
+                        Guid providerID = *((Guid*)data.userData);
+                        byte* eventInfoBuffer = (byte*)(data.userData + sizeof(Guid));
+                        int eventInfoBufferLength = data.EventDataLength - sizeof(Guid);
+                        RegisteredTraceEventParser.EVENT_MAP_INFO* eventInfo = (RegisteredTraceEventParser.EVENT_MAP_INFO*)eventInfoBuffer;
+                        IDictionary<long, string> map = RegisteredTraceEventParser.TdhEventParser.ParseMap(eventInfo, eventInfoBuffer, eventInfoBufferLength);
+                        string mapName;
+                        if (map != null && RegisteredTraceEventParser.TdhEventParser.TryReadMapName(eventInfo, eventInfoBuffer, eventInfoBufferLength, out mapName))
+                        {
+                            MapTable.Add(new MapKey(providerID, mapName), map);
+                        }
                     }
                 }
                 catch (Exception) { };
@@ -93,21 +102,26 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             TraceEventNativeMethods.EVENT_RECORD eventRecord = new TraceEventNativeMethods.EVENT_RECORD();
             eventRecord.EventHeader.ProviderId = providerGuid;
 
-            // We keep events of a given event number together in the output
+            // We keep events of a given event number together in the output (pre-rendered XML fragments)
             string providerName = null;
-            SortedDictionary<int, StringWriter> events = new SortedDictionary<int, StringWriter>();
+            SortedDictionary<int, List<string>> events = new SortedDictionary<int, List<string>>();
             // We keep tasks separated by task ID
             SortedDictionary<int, TaskInfo> tasks = new SortedDictionary<int, TaskInfo>();
-            // Templates where the KEY is the template string and the VALUE is the template name (backwards)  
+            // Templates: KEY is the rendered XML content of the template fields, VALUE is the template name
             Dictionary<string, string> templateIntern = new Dictionary<string, string>(8);
 
-            // Remember any enum types we have.   Value is XML for the enum (normal) 
+            // Maps: KEY is the map name, VALUE is rendered map XML
             Dictionary<string, string> enumIntern = new Dictionary<string, string>();
-            StringWriter enumLocalizations = new StringWriter();
+            // Maps: KEY is the map name, VALUE is the display name for the map attribute
+            Dictionary<string, string> enumDisplayNames = new Dictionary<string, string>();
+            List<KeyValuePair<string, string>> enumLocalizations = new List<KeyValuePair<string, string>>();
+
+            // Track emitted string IDs to prevent duplicates in the stringTable
+            HashSet<string> emittedStringIds = new HashSet<string>();
 
             // Any task names used so far 
             Dictionary<string, int> taskNames = new Dictionary<string, int>();
-            // Any  es used so far 
+            // Any opcodes used so far 
             Dictionary<string, int> opcodeNames = new Dictionary<string, int>();
             // This ensures that we have unique event names. 
             Dictionary<string, int> eventNames = new Dictionary<string, int>();
@@ -127,6 +141,13 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     keywords[keywordItem.Value] = MakeLegalIdentifier(keywordItem.Name);
                 }
             }
+
+            // XmlWriter settings for rendering XML fragments during enumeration
+            var fragmentSettings = new XmlWriterSettings
+            {
+                ConformanceLevel = ConformanceLevel.Fragment,
+                OmitXmlDeclaration = true
+            };
 
             int status;
 
@@ -266,20 +287,10 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                             symbolName += "_V" + eventInfo->EventDescriptor.Version;
                         }
 
-                        StringWriter eventWriter;
-                        if (!events.TryGetValue(eventInfo->EventDescriptor.Id, out eventWriter))
-                        {
-                            events[eventInfo->EventDescriptor.Id] = eventWriter = new StringWriter();
-                        }
-
-                        eventWriter.Write("     <event value=\"{0}\" symbol=\"{1}\" version=\"{2}\" task=\"{3}\"",
-                            eventInfo->EventDescriptor.Id,
-                            symbolName,
-                            eventInfo->EventDescriptor.Version,
-                            taskName);
+                        // Compute opcode attribute and register non-reserved opcodes with task
+                        string opcodeId = null;
                         if (eventInfo->EventDescriptor.Opcode != 0)
                         {
-                            string opcodeId;
                             if (eventInfo->EventDescriptor.Opcode < 10)       // It is a reserved opcode.  
                             {
                                 // For some reason opcodeName does not have the underscore, which we need. 
@@ -309,109 +320,135 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                                     taskInfo.Opcodes[eventInfo->EventDescriptor.Opcode] = opcodeId;
                                 }
                             }
-                            eventWriter.Write(" opcode=\"{0}\"", opcodeId);
                         }
+                        
                         // TODO handle cases outside standard levels 
+                        string level = null;
                         if ((int)TraceEventLevel.Always <= eventInfo->EventDescriptor.Level && eventInfo->EventDescriptor.Level <= (int)TraceEventLevel.Verbose)
                         {
                             var asLevel = (TraceEventLevel)eventInfo->EventDescriptor.Level;
-                            var levelName = "win:" + asLevel;
-                            eventWriter.Write(" level=\"{0}\"", levelName);
+                            level = "win:" + asLevel;
                         }
 
                         var keywordStr = GetKeywordStr(keywords, (ulong)eventInfo->EventDescriptor.Keyword);
-                        if (keywordStr.Length > 0)
-                        {
-                            eventWriter.Write(" keywords=\"" + keywordStr + "\"", eventInfo->EventDescriptor.Keyword);
-                        }
 
+                        // Process properties and build template content using XmlWriter
+                        string templateName = null;
                         if (eventInfo->TopLevelPropertyCount != 0)
                         {
-                            var templateWriter = new StringWriter();
                             string[] propertyNames = new string[eventInfo->TopLevelPropertyCount];
-                            for (int j = 0; j < eventInfo->TopLevelPropertyCount; j++)
+                            var templateSb = new StringBuilder();
+                            using (var tw = XmlWriter.Create(templateSb, fragmentSettings))
                             {
-                                EVENT_PROPERTY_INFO* propertyInfo = &propertyInfos[j];
-                                var propertyName = new string((char*)(&eventInfoBuff[propertyInfo->NameOffset]));
-                                propertyNames[j] = propertyName;
-                                var enumAttrib = "";
-
-                                // Deal with any maps (bit fields or enumerations)
-                                if (propertyInfo->MapNameOffset != 0)
+                                for (int j = 0; j < eventInfo->TopLevelPropertyCount; j++)
                                 {
-                                    string mapName = new string((char*)(&eventInfoBuff[propertyInfo->MapNameOffset]));
+                                    EVENT_PROPERTY_INFO* propertyInfo = &propertyInfos[j];
+                                    var propertyName = new string((char*)(&eventInfoBuff[propertyInfo->NameOffset]));
+                                    propertyNames[j] = propertyName;
+                                    string mapAttrib = null;
 
-                                    if (enumBuffer == null)
+                                    // Deal with any maps (bit fields or enumerations)
+                                    if (propertyInfo->MapNameOffset != 0)
                                     {
-                                        enumBuffer = (byte*)System.Runtime.InteropServices.Marshal.AllocHGlobal(buffSize);
-                                    }
+                                        string mapName = new string((char*)(&eventInfoBuff[propertyInfo->MapNameOffset]));
 
-                                    if (!enumIntern.ContainsKey(mapName))
-                                    {
-                                        EVENT_MAP_INFO* enumInfo = (EVENT_MAP_INFO*)enumBuffer;
-                                        var hr = TdhGetEventMapInformation(&eventRecord, mapName, enumInfo, ref buffSize);
-                                        if (hr == 0)
+                                        if (enumBuffer == null)
                                         {
-                                            // We only support manifest enums for now.  
-                                            if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP ||
-                                                enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_BITMAP)
+                                            enumBuffer = (byte*)System.Runtime.InteropServices.Marshal.AllocHGlobal(buffSize);
+                                        }
+
+                                        string existingDisplayName;
+                                        if (!enumIntern.ContainsKey(mapName))
+                                        {
+                                            EVENT_MAP_INFO* enumInfo = (EVENT_MAP_INFO*)enumBuffer;
+                                            var hr = TdhGetEventMapInformation(&eventRecord, mapName, enumInfo, ref buffSize);
+                                            if (hr == 0)
                                             {
-                                                StringWriter enumWriter = new StringWriter();
-                                                string enumName = new string((char*)(&enumBuffer[enumInfo->NameOffset]));
-                                                enumAttrib = " map=\"" + enumName + "\"";
-                                                if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP)
+                                                // We only support manifest enums for now.  
+                                                if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP ||
+                                                    enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_BITMAP)
                                                 {
-                                                    enumWriter.WriteLine("     <valueMap name=\"{0}\">", enumName);
-                                                }
-                                                else
-                                                {
-                                                    enumWriter.WriteLine("     <bitMap name=\"{0}\">", enumName);
-                                                }
+                                                    string enumName = new string((char*)(&enumBuffer[enumInfo->NameOffset]));
 
-                                                EVENT_MAP_ENTRY* mapEntries = &enumInfo->MapEntryArray;
-                                                for (int k = 0; k < enumInfo->EntryCount; k++)
-                                                {
-                                                    int value = mapEntries[k].Value;
-                                                    string valueName = new string((char*)(&enumBuffer[mapEntries[k].NameOffset])).Trim();
-                                                    enumWriter.WriteLine("      <map value=\"0x{0:x}\" message=\"$(string.map_{1}{2})\"/>", value, enumName, valueName);
-                                                    enumLocalizations.WriteLine("    <string id=\"map_{0}{1}\" value=\"{2}\"/>", enumName, valueName, valueName);
-                                                }
-                                                if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP)
-                                                {
-                                                    enumWriter.WriteLine("     </valueMap>", enumName);
-                                                }
-                                                else
-                                                {
-                                                    enumWriter.WriteLine("     </bitMap>", enumName);
-                                                }
+                                                    // Render map XML using XmlWriter
+                                                    var mapSb = new StringBuilder();
+                                                    using (var mw = XmlWriter.Create(mapSb, fragmentSettings))
+                                                    {
+                                                        mw.WriteStartElement(
+                                                            enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP
+                                                                ? "valueMap" : "bitMap");
+                                                        mw.WriteAttributeString("name", enumName);
 
-                                                enumIntern[mapName] = enumWriter.ToString();
+                                                        EVENT_MAP_ENTRY* mapEntries = &enumInfo->MapEntryArray;
+                                                        for (int k = 0; k < enumInfo->EntryCount; k++)
+                                                        {
+                                                            int value = mapEntries[k].Value;
+                                                            string valueName = new string((char*)(&enumBuffer[mapEntries[k].NameOffset])).Trim();
+                                                            string stringId = $"map_{enumName}{valueName}";
+
+                                                            mw.WriteStartElement("map");
+                                                            mw.WriteAttributeString("value", $"0x{value:x}");
+                                                            mw.WriteAttributeString("message", $"$(string.{stringId})");
+                                                            mw.WriteEndElement();
+
+                                                            if (emittedStringIds.Add(stringId))
+                                                            {
+                                                                enumLocalizations.Add(new KeyValuePair<string, string>(stringId, valueName));
+                                                            }
+                                                        }
+
+                                                        mw.WriteEndElement(); // valueMap or bitMap
+                                                    }
+
+                                                    enumIntern[mapName] = mapSb.ToString();
+                                                    enumDisplayNames[mapName] = enumName;
+                                                }
                                             }
                                         }
+
+                                        if (enumDisplayNames.TryGetValue(mapName, out existingDisplayName))
+                                        {
+                                            mapAttrib = existingDisplayName;
+                                        }
                                     }
-                                }
 
-                                // Remove anything that does not look like an ID (.e.g space)
-                                propertyName = Regex.Replace(propertyName, "[^A-Za-z0-9_]", "");
-                                TdhInputType propertyType = propertyInfo->InType;
-                                string countOrLengthAttrib = "";
+                                    // Remove anything that does not look like an ID (.e.g space)
+                                    propertyName = Regex.Replace(propertyName, "[^A-Za-z0-9_]", "");
+                                    TdhInputType propertyType = propertyInfo->InType;
+                                    string countAttrib = null;
+                                    string lengthAttrib = null;
 
-                                if ((propertyInfo->Flags & PROPERTY_FLAGS.ParamCount) != 0)
-                                {
-                                    countOrLengthAttrib = " count=\"" + propertyNames[propertyInfo->CountOrCountIndex] + "\"";
-                                }
-                                else if ((propertyInfo->Flags & PROPERTY_FLAGS.ParamLength) != 0)
-                                {
-                                    countOrLengthAttrib = " length=\"" + propertyNames[propertyInfo->LengthOrLengthIndex] + "\"";
-                                }
+                                    if ((propertyInfo->Flags & PROPERTY_FLAGS.ParamCount) != 0)
+                                    {
+                                        countAttrib = propertyNames[propertyInfo->CountOrCountIndex];
+                                    }
+                                    else if ((propertyInfo->Flags & PROPERTY_FLAGS.ParamLength) != 0)
+                                    {
+                                        lengthAttrib = propertyNames[propertyInfo->LengthOrLengthIndex];
+                                    }
 
-                                templateWriter.WriteLine("      <data name=\"{0}\" inType=\"win:{1}\"{2}{3}/>", propertyName, propertyType.ToString(), enumAttrib, countOrLengthAttrib);
+                                    tw.WriteStartElement("data");
+                                    tw.WriteAttributeString("name", propertyName);
+                                    tw.WriteAttributeString("inType", "win:" + propertyType.ToString());
+                                    if (mapAttrib != null)
+                                    {
+                                        tw.WriteAttributeString("map", mapAttrib);
+                                    }
+                                    if (countAttrib != null)
+                                    {
+                                        tw.WriteAttributeString("count", countAttrib);
+                                    }
+                                    if (lengthAttrib != null)
+                                    {
+                                        tw.WriteAttributeString("length", lengthAttrib);
+                                    }
+                                    tw.WriteEndElement();
+                                }
                             }
-                            var templateStr = templateWriter.ToString();
 
-                            // See if this template already exists, and if not make it 
-                            string templateName;
-                            if (!templateIntern.TryGetValue(templateStr, out templateName))
+                            // Template dedup using rendered content
+                            string templateContent = templateSb.ToString();
+                            if (!templateIntern.TryGetValue(templateContent, out templateName))
                             {
                                 templateName = eventName + "Args";
                                 if (eventInfo->EventDescriptor.Version > 0)
@@ -419,11 +456,49 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                                     templateName += "_V" + eventInfo->EventDescriptor.Version;
                                 }
 
-                                templateIntern[templateStr] = templateName;
+                                templateIntern[templateContent] = templateName;
                             }
-                            eventWriter.Write(" template=\"{0}\"", templateName);
                         }
-                        eventWriter.WriteLine("/>");
+
+                        // Render event element using XmlWriter
+                        var eventSb = new StringBuilder();
+                        using (var ew = XmlWriter.Create(eventSb, fragmentSettings))
+                        {
+                            ew.WriteStartElement("event");
+                            ew.WriteAttributeString("value", eventInfo->EventDescriptor.Id.ToString());
+                            ew.WriteAttributeString("symbol", symbolName);
+                            ew.WriteAttributeString("version", eventInfo->EventDescriptor.Version.ToString());
+                            ew.WriteAttributeString("task", taskName);
+                            
+                            if (opcodeId != null)
+                            {
+                                ew.WriteAttributeString("opcode", opcodeId);
+                            }
+                            
+                            if (level != null)
+                            {
+                                ew.WriteAttributeString("level", level);
+                            }
+                            
+                            if (keywordStr.Length > 0)
+                            {
+                                ew.WriteAttributeString("keywords", keywordStr);
+                            }
+                            
+                            if (templateName != null)
+                            {
+                                ew.WriteAttributeString("template", templateName);
+                            }
+                            
+                            ew.WriteEndElement();
+                        }
+
+                        List<string> eventList;
+                        if (!events.TryGetValue(eventInfo->EventDescriptor.Id, out eventList))
+                        {
+                            events[eventInfo->EventDescriptor.Id] = eventList = new List<string>();
+                        }
+                        eventList.Add(eventSb.ToString());
                     }
                 }
             }
@@ -437,95 +512,164 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 throw new ApplicationException("Could not find provider with at GUID of " + providerGuid.ToString());
             }
 
-            StringWriter manifest = new StringWriter();
-            manifest.WriteLine("<instrumentationManifest xmlns=\"http://schemas.microsoft.com/win/2004/08/events\">");
-            manifest.WriteLine(" <instrumentation xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:win=\"http://manifests.microsoft.com/win/2004/08/windows/events\">");
-            manifest.WriteLine("  <events>");
-            manifest.WriteLine("   <provider name=\"{0}\" guid=\"{{{1}}}\" resourceFileName=\"{0}\" messageFileName=\"{0}\" symbol=\"{2}\" source=\"Xml\" >",
-                    providerName, providerGuid, Regex.Replace(providerName, @"[^\w]", ""));
-
-            StringWriter localizedStrings = new StringWriter();
-
-            if (keywords != null)
+            // Now write the XML using XmlWriter
+            var sb = new StringBuilder();
+            var settings = new XmlWriterSettings
             {
-                manifest.WriteLine("    <keywords>");
-                foreach (var keyValue in keywords)
-                {
-                    manifest.WriteLine("     <keyword name=\"{0}\" message=\"$(string.keyword_{1})\" mask=\"0x{2:x}\"/>",
-                        keyValue.Value, keyValue.Value, keyValue.Key);
-                    localizedStrings.WriteLine("    <string id=\"keyword_{0}\" value=\"{1}\"/>", keyValue.Value, keyValue.Value);
-                }
-                manifest.WriteLine("    </keywords>");
-            }
+                Indent = true,
+                IndentChars = " ",
+                NewLineChars = "\r\n",
+                OmitXmlDeclaration = true
+            };
 
-            manifest.WriteLine("    <tasks>");
-            foreach (var taskValue in tasks.Keys)
+            using (var writer = XmlWriter.Create(sb, settings))
             {
-                var task = tasks[taskValue];
-                manifest.WriteLine("     <task name=\"{0}\" message=\"$(string.task_{1})\" value=\"{2}\"{3}>", task.Name, task.Name, taskValue,
-                    task.Opcodes == null ? "/" : "");       // If no opcodes, terminate immediately.  
-                localizedStrings.WriteLine("    <string id=\"task_{0}\" value=\"{1}\"/>", task.Name, task.Name);
-                if (task.Opcodes != null)
+                writer.WriteStartElement("instrumentationManifest", "http://schemas.microsoft.com/win/2004/08/events");
+                
+                writer.WriteStartElement("instrumentation");
+                writer.WriteAttributeString("xmlns", "xs", null, "http://www.w3.org/2001/XMLSchema");
+                writer.WriteAttributeString("xmlns", "xsi", null, "http://www.w3.org/2001/XMLSchema-instance");
+                writer.WriteAttributeString("xmlns", "win", null, "http://manifests.microsoft.com/win/2004/08/windows/events");
+                
+                writer.WriteStartElement("events");
+                
+                writer.WriteStartElement("provider");
+                writer.WriteAttributeString("name", providerName);
+                writer.WriteAttributeString("guid", "{" + providerGuid.ToString() + "}");
+                writer.WriteAttributeString("resourceFileName", providerName);
+                writer.WriteAttributeString("messageFileName", providerName);
+                writer.WriteAttributeString("symbol", Regex.Replace(providerName, @"[^\w]", ""));
+                writer.WriteAttributeString("source", "Xml");
+
+                // Collect localized strings
+                List<KeyValuePair<string, string>> localizedStrings = new List<KeyValuePair<string, string>>();
+
+                // Keywords
+                if (keywords != null && keywords.Count > 0)
                 {
-                    manifest.WriteLine(">");
-                    manifest.WriteLine("      <opcodes>");
-                    foreach (var keyValue in task.Opcodes)
+                    writer.WriteStartElement("keywords");
+                    foreach (var keyValue in keywords)
                     {
-                        manifest.WriteLine("       <opcode name=\"{0}\" message=\"$(string.opcode_{1}{2})\" value=\"{3}\"/>",
-                            keyValue.Value, task.Name, keyValue.Value, keyValue.Key);
-                        localizedStrings.WriteLine("    <string id=\"opcode_{0}{1}\" value=\"{2}\"/>", task.Name, keyValue.Value, keyValue.Value);
+                        string stringId = $"keyword_{keyValue.Value}";
+                        writer.WriteStartElement("keyword");
+                        writer.WriteAttributeString("name", keyValue.Value);
+                        writer.WriteAttributeString("message", $"$(string.{stringId})");
+                        writer.WriteAttributeString("mask", $"0x{keyValue.Key:x}");
+                        writer.WriteEndElement();
+                        
+                        if (emittedStringIds.Add(stringId))
+                        {
+                            localizedStrings.Add(new KeyValuePair<string, string>(stringId, keyValue.Value));
+                        }
                     }
-                    manifest.WriteLine("      </opcodes>");
-                    manifest.WriteLine("     </task>");
+                    writer.WriteEndElement(); // keywords
                 }
-            }
-            manifest.WriteLine("    </tasks>");
 
-            if (enumIntern.Count > 0)
-            {
-                manifest.WriteLine("    <maps>");
-                foreach (var map in enumIntern.Values)
+                // Tasks
+                writer.WriteStartElement("tasks");
+                foreach (var taskValue in tasks.Keys)
                 {
-                    manifest.Write(map);
+                    var task = tasks[taskValue];
+                    string taskStringId = $"task_{task.Name}";
+                    
+                    writer.WriteStartElement("task");
+                    writer.WriteAttributeString("name", task.Name);
+                    writer.WriteAttributeString("message", $"$(string.{taskStringId})");
+                    writer.WriteAttributeString("value", taskValue.ToString());
+                    
+                    if (emittedStringIds.Add(taskStringId))
+                    {
+                        localizedStrings.Add(new KeyValuePair<string, string>(taskStringId, task.Name));
+                    }
+                    
+                    if (task.Opcodes != null)
+                    {
+                        writer.WriteStartElement("opcodes");
+                        foreach (var keyValue in task.Opcodes)
+                        {
+                            string opcodeStringId = $"opcode_{task.Name}{keyValue.Value}";
+                            writer.WriteStartElement("opcode");
+                            writer.WriteAttributeString("name", keyValue.Value);
+                            writer.WriteAttributeString("message", $"$(string.{opcodeStringId})");
+                            writer.WriteAttributeString("value", keyValue.Key.ToString());
+                            writer.WriteEndElement();
+                            
+                            if (emittedStringIds.Add(opcodeStringId))
+                            {
+                                localizedStrings.Add(new KeyValuePair<string, string>(opcodeStringId, keyValue.Value));
+                            }
+                        }
+                        writer.WriteEndElement(); // opcodes
+                    }
+                    
+                    writer.WriteEndElement(); // task
+                }
+                writer.WriteEndElement(); // tasks
+
+                // Maps
+                if (enumIntern.Count > 0)
+                {
+                    writer.WriteStartElement("maps");
+                    foreach (var mapXml in enumIntern.Values)
+                    {
+                        writer.WriteRaw(mapXml);
+                    }
+                    writer.WriteEndElement(); // maps
+                    
+                    localizedStrings.AddRange(enumLocalizations);
                 }
 
-                manifest.WriteLine("    </maps>");
-                localizedStrings.Write(enumLocalizations.ToString());
+                // Events
+                writer.WriteStartElement("events");
+                foreach (var eventList in events.Values)
+                {
+                    foreach (var eventXml in eventList)
+                    {
+                        writer.WriteRaw(eventXml);
+                    }
+                }
+                writer.WriteEndElement(); // events
+
+                // Templates
+                writer.WriteStartElement("templates");
+                foreach (var kvp in templateIntern)
+                {
+                    writer.WriteStartElement("template");
+                    writer.WriteAttributeString("tid", kvp.Value);
+                    writer.WriteRaw(kvp.Key);
+                    writer.WriteEndElement(); // template
+                }
+                writer.WriteEndElement(); // templates
+                
+                writer.WriteEndElement(); // provider
+                writer.WriteEndElement(); // events
+                writer.WriteEndElement(); // instrumentation
+
+                // Localization
+                if (localizedStrings.Count > 0)
+                {
+                    writer.WriteStartElement("localization");
+                    writer.WriteStartElement("resources");
+                    writer.WriteAttributeString("culture", IetfLanguageTag(CultureInfo.CurrentCulture));
+                    
+                    writer.WriteStartElement("stringTable");
+                    foreach (var entry in localizedStrings)
+                    {
+                        writer.WriteStartElement("string");
+                        writer.WriteAttributeString("id", entry.Key);
+                        writer.WriteAttributeString("value", entry.Value);
+                        writer.WriteEndElement();
+                    }
+                    writer.WriteEndElement(); // stringTable
+                    
+                    writer.WriteEndElement(); // resources
+                    writer.WriteEndElement(); // localization
+                }
+                
+                writer.WriteEndElement(); // instrumentationManifest
             }
 
-            manifest.WriteLine("    <events>");
-            foreach (StringWriter eventStr in events.Values)
-            {
-                manifest.Write(eventStr.ToString());
-            }
-
-            manifest.WriteLine("    </events>");
-
-            manifest.WriteLine("    <templates>");
-            foreach (var keyValue in templateIntern)
-            {
-                manifest.WriteLine("     <template tid=\"{0}\">", keyValue.Value);
-                manifest.Write(keyValue.Key);
-                manifest.WriteLine("     </template>");
-            }
-            manifest.WriteLine("    </templates>");
-            manifest.WriteLine("   </provider>");
-            manifest.WriteLine("  </events>");
-            manifest.WriteLine(" </instrumentation>");
-            string strings = localizedStrings.ToString();
-            if (strings.Length > 0)
-            {
-                manifest.WriteLine(" <localization>");
-                manifest.WriteLine("  <resources culture=\"{0}\">", IetfLanguageTag(CultureInfo.CurrentCulture));
-                manifest.WriteLine("   <stringTable>");
-                manifest.Write(strings);
-                manifest.WriteLine("   </stringTable>");
-                manifest.WriteLine("  </resources>");
-                manifest.WriteLine(" </localization>");
-            }
-
-            manifest.WriteLine("</instrumentationManifest>");
-            return manifest.ToString(); ;
+            return sb.ToString();
         }
 
         #region private
@@ -583,6 +727,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             }
             return ret;
         }
+
 
         /// <summary>
         /// Class used to accumulate information about Tasks in the implementation of GetManifestForRegisteredProvider
@@ -654,8 +799,11 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
                 if (status == 0)
                 {
-                    ret = (new TdhEventParser(buffer, unknownEvent.eventRecord, mapTable)).ParseEventMetaData();
-                    ret.containsSelfDescribingMetadata = hasETWEventInformation;
+                    ret = (new TdhEventParser(buffer, buffSize, unknownEvent.eventRecord, mapTable)).ParseEventMetaData();
+                    if (ret != null)
+                    {
+                        ret.containsSelfDescribingMetadata = hasETWEventInformation;
+                    }
                 }
 
                 System.Runtime.InteropServices.Marshal.FreeHGlobal((IntPtr)buffer);
@@ -673,14 +821,17 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
         internal class TdhEventParser
         {
             /// <summary>
-            /// Creates a new parser from the TRACE_EVENT_INFO held in 'buffer'.  Use
+            /// Creates a new parser from the TRACE_EVENT_INFO held in 'eventInfo'.  Use
             /// ParseEventMetaData to then parse it into a DynamicTraceEventData structure.
-            ///  EventRecord can be null and mapTable if present allow the parser to resolve maps (enums), and can be null.  
+            /// eventInfoLength is the length in bytes of the buffer pointed to by 'eventInfo'; every offset and array
+            /// extent contained in the TRACE_EVENT_INFO is bounds-checked against this length before being dereferenced.
+            /// eventRecord can be null and mapTable if present allow the parser to resolve maps (enums), and can be null.
             /// </summary>
-            public TdhEventParser(byte* eventInfo, TraceEventNativeMethods.EVENT_RECORD* eventRecord, Dictionary<MapKey, IDictionary<long, string>> mapTable)
+            public TdhEventParser(byte* eventInfo, int eventInfoLength, TraceEventNativeMethods.EVENT_RECORD* eventRecord, Dictionary<MapKey, IDictionary<long, string>> mapTable)
             {
                 eventBuffer = eventInfo;
                 this.eventInfo = (TRACE_EVENT_INFO*)eventInfo;
+                this.eventInfoLength = eventInfoLength;
                 propertyInfos = &this.eventInfo->EventPropertyInfoArray;
                 this.eventRecord = eventRecord;
                 this.mapTable = mapTable;
@@ -692,29 +843,41 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             /// <returns></returns>
             public DynamicTraceEventData ParseEventMetaData()
             {
+                if (!ValidateEventInfo())
+                {
+                    return null;
+                }
+
                 EVENT_PROPERTY_INFO* propertyInfos = &eventInfo->EventPropertyInfoArray;
                 string taskName = null;
                 if (eventInfo->TaskNameOffset != 0)
                 {
-                    taskName = MakeLegalIdentifier(new string((char*)(&eventBuffer[eventInfo->TaskNameOffset])));
+                    taskName = ReadString(eventInfo->TaskNameOffset);
+                    if (taskName != null)
+                    {
+                        taskName = MakeLegalIdentifier(taskName);
+                    }
                 }
 
                 string opcodeName = null;
                 if (eventInfo->OpcodeNameOffset != 0)
                 {
-                    opcodeName = new string((char*)(&eventBuffer[eventInfo->OpcodeNameOffset]));
-                    if (opcodeName.StartsWith("win:"))
+                    opcodeName = ReadString(eventInfo->OpcodeNameOffset);
+                    if (opcodeName != null)
                     {
-                        opcodeName = opcodeName.Substring(4);
-                    }
+                        if (opcodeName.StartsWith("win:"))
+                        {
+                            opcodeName = opcodeName.Substring(4);
+                        }
 
-                    opcodeName = MakeLegalIdentifier(opcodeName);
+                        opcodeName = MakeLegalIdentifier(opcodeName);
+                    }
                 }
 
                 string providerName = "UnknownProvider";
                 if (eventInfo->ProviderNameOffset != 0)
                 {
-                    providerName = new string((char*)(&eventBuffer[eventInfo->ProviderNameOffset]));
+                    providerName = ReadString(eventInfo->ProviderNameOffset) ?? providerName;
                 }
 
                 var eventID = eventInfo->EventDescriptor.Id;
@@ -737,11 +900,16 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
                 if (eventInfo->EventMessageOffset != 0)
                 {
-                    newTemplate.MessageFormat = new string((char*)(&eventBuffer[eventInfo->EventMessageOffset]));
+                    newTemplate.MessageFormat = ReadString(eventInfo->EventMessageOffset);
                 }
 
                 Debug.WriteLine("In TdhEventParser for event" + providerName + "/" + taskName + "/" + opcodeName + " with " + eventInfo->TopLevelPropertyCount + " fields");
                 DynamicTraceEventData.PayloadFetchClassInfo fields = ParseFields(0, eventInfo->TopLevelPropertyCount);
+                if (fields == null)
+                {
+                    return null;
+                }
+
                 newTemplate.payloadNames = fields.FieldNames;
                 newTemplate.payloadFetches = fields.FieldFetches;
 
@@ -755,15 +923,37 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             /// </summary>
             private DynamicTraceEventData.PayloadFetchClassInfo ParseFields(int startField, int numFields)
             {
+                _totalFieldsParsed = 0;
+                return ParseFields(startField, numFields, 0);
+            }
+
+            private DynamicTraceEventData.PayloadFetchClassInfo ParseFields(int startField, int numFields, int recursionDepth)
+            {
+                if (!ValidateFieldRange(startField, numFields) || recursionDepth > MaxParseFieldRecursionDepth)
+                {
+                    return null;
+                }
+
                 ushort fieldOffset = 0;
                 var fieldNames = new List<string>(numFields);
                 var fieldFetches = new List<DynamicTraceEventData.PayloadFetch>(numFields);
 
                 for (int curField = 0; curField < numFields; curField++)
                 {
+                    // Bound the *total* number of fields parsed across all recursion frames.  In well-formed
+                    // metadata struct membership partitions the property array, so every property is parsed
+                    // exactly once and the cumulative count never exceeds PropertyCount.  A crafted blob whose
+                    // structs reference overlapping/shared ranges would otherwise re-parse properties and blow
+                    // up exponentially (the depth cap below bounds depth, not total work).  Exceeding
+                    // PropertyCount therefore proves the metadata is malformed, so reject the whole template.
+                    if (++_totalFieldsParsed > eventInfo->PropertyCount)
+                    {
+                        return null;
+                    }
+
                     DynamicTraceEventData.PayloadFetch propertyFetch = new DynamicTraceEventData.PayloadFetch();
                     var propertyInfo = &propertyInfos[curField + startField];
-                    var propertyName = new string((char*)(&eventBuffer[propertyInfo->NameOffset]));
+                    var propertyName = ReadString(propertyInfo->NameOffset) ?? string.Empty;
                     // Remove anything that does not look like an ID (.e.g space)
                     propertyName = Regex.Replace(propertyName, "[^A-Za-z0-9_]", "");
 
@@ -782,11 +972,11 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     {
                         int numStructFields = propertyInfo->NumOfStructMembers;
                         Debug.WriteLine("   " + propertyName + " Is a nested type with " + numStructFields + " fields {");
-                        DynamicTraceEventData.PayloadFetchClassInfo classInfo = ParseFields(propertyInfo->StructStartIndex, numStructFields);
+                        DynamicTraceEventData.PayloadFetchClassInfo classInfo = ParseFields(propertyInfo->StructStartIndex, numStructFields, recursionDepth + 1);
                         if (classInfo == null)
                         {
                             Debug.WriteLine("    Failure parsing nested struct.");
-                            goto Exit;
+                            return null;
                         }
                         Debug.WriteLine(" } " + propertyName + " Nested struct completes.");
                         propertyFetch = DynamicTraceEventData.PayloadFetch.StructPayloadFetch(fieldOffset, classInfo);
@@ -803,42 +993,47 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                         // Deal with any maps (bit fields or enumerations)
                         if (propertyInfo->MapNameOffset != 0)
                         {
-                            string mapName = new string((char*)(&eventBuffer[propertyInfo->MapNameOffset]));
+                            string mapName = ReadString(propertyInfo->MapNameOffset);
 
-                            // Normal case, you can look up the enum information immediately. 
-                            if (eventRecord != null)
+                            // If the map name is out of range we simply skip the map and parse the field
+                            // as its underlying integer type rather than rejecting the whole event.
+                            if (mapName != null)
                             {
-                                int buffSize = 84000;  // TODO this is inefficient (and incorrect for very large enums).  
-                                byte* enumBuffer = (byte*)System.Runtime.InteropServices.Marshal.AllocHGlobal(buffSize);
-
-                                EVENT_MAP_INFO* enumInfo = (EVENT_MAP_INFO*)enumBuffer;
-                                var hr = TdhGetEventMapInformation(eventRecord, mapName, enumInfo, ref buffSize);
-                                if (hr == 0)
+                                // Normal case, you can look up the enum information immediately. 
+                                if (eventRecord != null)
                                 {
-                                    propertyFetch.Map = ParseMap(enumInfo, enumBuffer);
-                                }
+                                    int buffSize = 84000;  // TODO this is inefficient (and incorrect for very large enums).  
+                                    byte* enumBuffer = (byte*)System.Runtime.InteropServices.Marshal.AllocHGlobal(buffSize);
 
-                                System.Runtime.InteropServices.Marshal.FreeHGlobal((IntPtr)enumBuffer);
-                            }
-                            else
-                            {
-                                // This is the kernelTraceControl case,  the map information will be provided
-                                // later, so we have to set up a LAZY map which will be evaluated when we need the
-                                // enum (giving time for the enum definition to be processed. 
-                                var mapKey = new MapKey(eventInfo->ProviderGuid, mapName);
-
-                                // Set the map to be a lazyMap, which is a Func that returns a map.  
-                                Func<IDictionary<long, string>> lazyMap = delegate ()
-                                {
-                                    IDictionary<long, string> map = null;
-                                    if (mapTable != null)
+                                    EVENT_MAP_INFO* enumInfo = (EVENT_MAP_INFO*)enumBuffer;
+                                    var hr = TdhGetEventMapInformation(eventRecord, mapName, enumInfo, ref buffSize);
+                                    if (hr == 0)
                                     {
-                                        mapTable.TryGetValue(mapKey, out map);
+                                        propertyFetch.Map = ParseMap(enumInfo, enumBuffer, buffSize);
                                     }
 
-                                    return map;
-                                };
-                                propertyFetch.LazyMap = lazyMap;
+                                    System.Runtime.InteropServices.Marshal.FreeHGlobal((IntPtr)enumBuffer);
+                                }
+                                else
+                                {
+                                    // This is the kernelTraceControl case,  the map information will be provided
+                                    // later, so we have to set up a LAZY map which will be evaluated when we need the
+                                    // enum (giving time for the enum definition to be processed. 
+                                    var mapKey = new MapKey(eventInfo->ProviderGuid, mapName);
+
+                                    // Set the map to be a lazyMap, which is a Func that returns a map.  
+                                    Func<IDictionary<long, string>> lazyMap = delegate ()
+                                    {
+                                        IDictionary<long, string> map = null;
+                                        if (mapTable != null)
+                                        {
+                                            mapTable.TryGetValue(mapKey, out map);
+                                        }
+
+                                        return map;
+                                    };
+                                    propertyFetch.LazyMap = lazyMap;
+                                }
                             }
                         }
                     }
@@ -869,6 +1064,14 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                             if (countOrCountIndex == startField + curField - 1)
                             {
                                 var lastFieldIdx = fieldFetches.Count - 1;
+                                if (lastFieldIdx < 0)
+                                {
+                                    // Malformed metadata: the count index points before the current (nested) parse
+                                    // frame, so there is no preceding field in this frame to consume as the prefix.
+                                    // Reject the template rather than indexing fieldFetches[-1] on the untrusted path.
+                                    return null;
+                                }
+
                                 arraySize = DynamicTraceEventData.COUNTED_SIZE + DynamicTraceEventData.CONSUMES_FIELD + DynamicTraceEventData.ELEM_COUNT;
                                 if (fieldFetches[lastFieldIdx].Size == 4)
                                 {
@@ -908,7 +1111,17 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                         else
                         {
                             Debug.WriteLine("     Field is an array of size " + ((fixedCount != 0) ? fixedCount.ToString() : "VARIABLE") + " of type " + ((propertyFetch.Type ?? typeof(void))) + " at offset " + arrayFieldOffset.ToString("x"));
-                            propertyFetch = DynamicTraceEventData.PayloadFetch.ArrayPayloadFetch(arrayFieldOffset, propertyFetch, arraySize, fixedCount, projectCharArrayAsString:false);
+                            if (fixedCount != 0)
+                            {
+                                // Use FixedCountArrayPayloadFetch so that Size is set to the total byte size
+                                // (fixedCount * element.Size) rather than just the element count, ensuring that
+                                // subsequent field offsets are computed correctly.
+                                propertyFetch = DynamicTraceEventData.PayloadFetch.FixedCountArrayPayloadFetch(arrayFieldOffset, propertyFetch, fixedCount, projectCharArrayAsString:false);
+                            }
+                            else
+                            {
+                                propertyFetch = DynamicTraceEventData.PayloadFetch.ArrayPayloadFetch(arrayFieldOffset, propertyFetch, arraySize, 0, projectCharArrayAsString:false);
+                            }
                         }
 
                         fieldOffset = ushort.MaxValue;           // Indicate that the next offset must be computed at run time. 
@@ -936,44 +1149,146 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 return ret; ;
             }
 
-            // Parses a EVENT_MAP_INFO into a Dictionary for a Value map or a SortedDictionary for a Bitmap
-            // returns null if it does not know how to parse it.  
-            internal static unsafe IDictionary<long, string> ParseMap(EVENT_MAP_INFO* enumInfo, byte* enumBuffer)
+            // Parses a EVENT_MAP_INFO into a Dictionary for a Value map or a SortedDictionary for a Bitmap.
+            // 'enumBufferLength' is the length in bytes of the buffer pointed to by 'enumBuffer'; every offset and array
+            // extent contained in the EVENT_MAP_INFO is bounds-checked against this length before being dereferenced.
+            // Returns null if it does not know how to parse it or if the metadata fails validation.
+            internal static unsafe IDictionary<long, string> ParseMap(EVENT_MAP_INFO* enumInfo, byte* enumBuffer, int enumBufferLength)
             {
-                IDictionary<long, string> map = null;
-                // We only support manifest enums for now.  
-                if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP ||
-                    enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_BITMAP)
+                if (enumInfo == null || !ValidateRange(enumBufferLength, 0, EventMapInfoEntryArrayOffset))
                 {
-                    StringWriter enumWriter = new StringWriter();
-                    string enumName = new string((char*)(&enumBuffer[enumInfo->NameOffset]));
-
-                    if (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP)
-                    {
-                        map = new Dictionary<long, string>();
-                    }
-                    else
-                    {
-                        map = new SortedDictionary<long, string>();
-                    }
-
-                    EVENT_MAP_ENTRY* mapEntries = &enumInfo->MapEntryArray;
-                    for (int k = 0; k < enumInfo->EntryCount; k++)
-                    {
-                        int value = mapEntries[k].Value;
-                        string valueName = new string((char*)(&enumBuffer[mapEntries[k].NameOffset])).Trim();
-                        map[value] = valueName;
-                    }
+                    return null;
                 }
+
+                // We only support manifest enums for now.
+                if (enumInfo->Flag != MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP &&
+                    enumInfo->Flag != MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_BITMAP)
+                {
+                    return null;
+                }
+
+                // The entry array must fit within the buffer before we can index into it below.
+                if (enumInfo->EntryCount < 0 ||
+                    !ValidateRange(enumBufferLength, EventMapInfoEntryArrayOffset, (long)enumInfo->EntryCount * EventMapEntrySize))
+                {
+                    return null;
+                }
+
+                IDictionary<long, string> map = (enumInfo->Flag == MAP_FLAGS.EVENTMAP_INFO_FLAG_MANIFEST_VALUEMAP)
+                    ? (IDictionary<long, string>)new Dictionary<long, string>()
+                    : new SortedDictionary<long, string>();
+
+                EVENT_MAP_ENTRY* mapEntries = &enumInfo->MapEntryArray;
+                for (int k = 0; k < enumInfo->EntryCount; k++)
+                {
+                    string valueName;
+                    if (!TryReadUnicodeString(enumBuffer, mapEntries[k].NameOffset, enumBufferLength, out valueName) || valueName == null)
+                    {
+                        return null;
+                    }
+
+                    map[mapEntries[k].Value] = valueName.Trim();
+                }
+
                 return map;
             }
 
+            // Reads the map's name (EVENT_MAP_INFO.NameOffset) from 'enumBuffer', bounds-checked against
+            // 'enumBufferLength'.  Returns false if the name offset is missing or out of range.
+            internal static unsafe bool TryReadMapName(EVENT_MAP_INFO* enumInfo, byte* enumBuffer, int enumBufferLength, out string mapName)
+            {
+                mapName = null;
+                return enumInfo != null &&
+                    ValidateRange(enumBufferLength, 0, EventMapInfoEntryArrayOffset) &&
+                    enumInfo->NameOffset != 0 &&
+                    TryReadUnicodeString(enumBuffer, enumInfo->NameOffset, enumBufferLength, out mapName);
+            }
+
+            // Validates the fixed-size TRACE_EVENT_INFO header and that the declared property array fits within
+            // the buffer.  This is the minimum required before ParseFields can safely index into the property
+            // array; individual string offsets and field ranges are bounds-checked at the point they are read.
+            private bool ValidateEventInfo()
+            {
+                if (eventInfo == null || !ValidateRange(eventInfoLength, 0, TraceEventInfoPropertyArrayOffset))
+                {
+                    return false;
+                }
+
+                if (eventInfo->PropertyCount < 0 ||
+                    eventInfo->TopLevelPropertyCount < 0 ||
+                    eventInfo->TopLevelPropertyCount > eventInfo->PropertyCount)
+                {
+                    return false;
+                }
+
+                return ValidateRange(eventInfoLength, TraceEventInfoPropertyArrayOffset, (long)eventInfo->PropertyCount * EventPropertyInfoSize);
+            }
+
+            private bool ValidateFieldRange(int startField, int numFields)
+            {
+                return startField >= 0 &&
+                    numFields >= 0 &&
+                    startField <= eventInfo->PropertyCount &&
+                    numFields <= eventInfo->PropertyCount - startField;
+            }
+
+            private string ReadString(int offset)
+            {
+                string value;
+                return TryReadUnicodeString(eventBuffer, offset, eventInfoLength, out value) ? value : null;
+            }
+
+            // Returns true if [offset, offset + size) lies entirely within a buffer of 'bufferLength' bytes.
+            private static bool ValidateRange(int bufferLength, int offset, long size)
+            {
+                return bufferLength >= 0 &&
+                    offset >= 0 &&
+                    size >= 0 &&
+                    offset <= bufferLength &&
+                    size <= bufferLength - offset;
+            }
+
+            // Reads a null-terminated Unicode string starting at 'offset' in 'buffer', refusing to read past
+            // 'bufferLength'.  An offset of 0 means the string is absent (returns true with a null value); any
+            // other offset that is out of range or lacks a terminator within the buffer returns false.
+            private static unsafe bool TryReadUnicodeString(byte* buffer, int offset, int bufferLength, out string value)
+            {
+                value = null;
+                if (offset == 0)
+                {
+                    return true;
+                }
+
+                if (!ValidateRange(bufferLength, offset, sizeof(char)))
+                {
+                    return false;
+                }
+
+                for (int i = offset; i <= bufferLength - sizeof(char); i += sizeof(char))
+                {
+                    if (buffer[i] == 0 && buffer[i + 1] == 0)
+                    {
+                        value = new string((char*)(&buffer[offset]));
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
             #region private
+            private const int MaxParseFieldRecursionDepth = 32;
+            private int _totalFieldsParsed;          // cumulative fields parsed across all ParseFields frames; bounds total work
+            private static readonly int TraceEventInfoPropertyArrayOffset = (int)Marshal.OffsetOf(typeof(TRACE_EVENT_INFO), "EventPropertyInfoArray");
+            private static readonly int EventPropertyInfoSize = Marshal.SizeOf(typeof(EVENT_PROPERTY_INFO));
+            private static readonly int EventMapInfoEntryArrayOffset = (int)Marshal.OffsetOf(typeof(EVENT_MAP_INFO), "MapEntryArray");
+            private static readonly int EventMapEntrySize = Marshal.SizeOf(typeof(EVENT_MAP_ENTRY));
             private TRACE_EVENT_INFO* eventInfo;
             private TraceEventNativeMethods.EVENT_RECORD* eventRecord;
             private Dictionary<MapKey, IDictionary<long, string>> mapTable;     // table of enums that have defined. 
             private EVENT_PROPERTY_INFO* propertyInfos;
             private byte* eventBuffer;                           // points at the eventInfo, but in increments of bytes 
+            private int eventInfoLength;
             #endregion // private
         }
 
@@ -1079,12 +1394,12 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             public PROPERTY_FLAGS Flags;
             public int NameOffset;
 
-            // These are valid if Flags & Struct not set. 
+            // These are valid if Flags & Struct not set.
             public TdhInputType InType;
-            public ushort OutType;             // Really TDH_OUT_TYPE
+            public TdhOutputType OutType;
             public int MapNameOffset;
 
-            // These are valid if Flags & Struct is set.  
+            // These are valid if Flags & Struct is set.
             public int StructStartIndex
             {
                 get
@@ -1160,6 +1475,51 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             SizeT,
             HexDump,
             WbemSID
+        };
+
+        internal enum TdhOutputType : ushort
+        {
+            Null,
+            String,
+            Datetime,
+            Byte,
+            UnsignedByte,
+            Short,
+            UnsignedShort,
+            Int,
+            UnsignedInt,
+            Long,
+            UnsignedLong,
+            Float,
+            Double,
+            Boolean,
+            Guid,
+            HexBinary,
+            HexInt8,
+            HexInt16,
+            HexInt32,
+            HexInt64,
+            Pid,
+            Tid,
+            Port,
+            Ipv4,
+            Ipv6,
+            SocketAddress,
+            CimDateTime,
+            EtwTime,
+            Xml,
+            ErrorCode,
+            Win32Error,
+            NtStatus,
+            HResult,
+            CultureInsensitiveDateTime,
+            JSON,
+            UTF8,
+            Pkcs7WithTypeInfo,
+            CodePointer,
+            DateTimeUtc,                // End of winmeta outtypes.
+            ReducedString = 300,        // Start of TDH outtypes for WBEM.
+            NoPrint,
         };
         #endregion
     }

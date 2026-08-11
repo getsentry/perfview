@@ -355,7 +355,20 @@ namespace Microsoft.Diagnostics.Tracing.Parsers.Universal.Events
 
         public string SymbolMetadata {get { return GetShortUTF8StringAt(SkipVarInt(0)); } }
 
-        internal ProcessMappingSymbolMetadata ParsedSymbolMetadata { get { return ProcessMappingSymbolMetadataParser.TryParse(SymbolMetadata); } }
+        internal ProcessMappingSymbolMetadata ParsedSymbolMetadata
+        {
+            get
+            {
+                if (!_parsedSymbolMetadataCached)
+                {
+                    _parsedSymbolMetadata = ProcessMappingSymbolMetadataParser.TryParse(SymbolMetadata);
+                    _parsedSymbolMetadataCached = true;
+                }
+                return _parsedSymbolMetadata;
+            }
+        }
+        private ProcessMappingSymbolMetadata _parsedSymbolMetadata;
+        private bool _parsedSymbolMetadataCached;
 
         public string VersionMetadata {get {return GetShortUTF8StringAt(SkipShortUTF8String(SkipVarInt(0))); } }
 
@@ -367,7 +380,17 @@ namespace Microsoft.Diagnostics.Tracing.Parsers.Universal.Events
         }
         protected internal override void Dispatch()
         {
+            _parsedSymbolMetadataCached = false;
+            _parsedSymbolMetadata = null;
             Action(this);
+        }
+
+        public override unsafe TraceEvent Clone()
+        {
+            var clone = (ProcessMappingMetadataTraceData)base.Clone();
+            clone._parsedSymbolMetadata = _parsedSymbolMetadata;
+            clone._parsedSymbolMetadataCached = _parsedSymbolMetadataCached;
+            return clone;
         }
 
         protected internal override Delegate Target
@@ -480,6 +503,12 @@ namespace Microsoft.Diagnostics.Tracing.Parsers.Universal.Events
         public string DebugLink { get; set; }
         [JsonPropertyName("build_id")]
         public string BuildId { get; set; }
+        [JsonPropertyName("p_vaddr")]
+        [JsonConverter(typeof(HexUInt64Converter))]
+        public ulong VirtualAddress { get; set; }
+        [JsonPropertyName("p_offset")]
+        [JsonConverter(typeof(HexUInt64Converter))]
+        public ulong FileOffset { get; set; }
     }
 
     internal enum ProcessMappingSymbolMetadataFileType
@@ -529,6 +558,45 @@ namespace Microsoft.Diagnostics.Tracing.Parsers.Universal.Events
         public override void Write(Utf8JsonWriter writer, ProcessMappingSymbolMetadata value, JsonSerializerOptions options)
         {
             JsonSerializer.Serialize(writer, value, value.GetType(), options);
+        }
+    }
+
+    internal class HexUInt64Converter : JsonConverter<ulong>
+    {
+        public override ulong Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Number)
+            {
+                return reader.GetUInt64();
+            }
+
+            if (reader.TokenType != JsonTokenType.String)
+            {
+                throw new JsonException($"Cannot convert token of type {reader.TokenType} to ulong.");
+            }
+
+            string text = reader.GetString();
+            if (text != null && text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) && text.Length > 2)
+            {
+                if (ulong.TryParse(text.Substring(2), System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out ulong hexValue))
+                {
+                    return hexValue;
+                }
+            }
+
+            if (ulong.TryParse(text, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out ulong value))
+            {
+                return value;
+            }
+
+            throw new JsonException($"Cannot convert \"{text}\" to ulong.");
+        }
+
+        public override void Write(Utf8JsonWriter writer, ulong value, JsonSerializerOptions options)
+        {
+            writer.WriteStringValue("0x" + value.ToString("X"));
         }
     }
 }

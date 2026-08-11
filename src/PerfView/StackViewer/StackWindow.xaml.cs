@@ -1325,19 +1325,19 @@ namespace PerfView
 
         private void DoViewInCallerCallee(object sender, RoutedEventArgs e)
         {
-            SetFocus(GetSelectedNodes().Single());
+            SetFocus(GetSelectedNodes().Single().Name);
 
             CallerCalleeTab.IsSelected = true;
         }
         private void DoViewInCallers(object sender, ExecutedRoutedEventArgs e)
         {
-            SetFocus(GetSelectedNodes().Single());
+            SetFocus(GetSelectedNodes().Single().Name);
 
             CallersTab.IsSelected = true;
         }
         private void DoViewInCallees(object sender, ExecutedRoutedEventArgs e)
         {
-            SetFocus(GetSelectedNodes().Single());
+            SetFocus(GetSelectedNodes().Single().Name);
 
             CalleesTab.IsSelected = true;
         }
@@ -2592,8 +2592,15 @@ namespace PerfView
         private void ByName_MouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
             e.Handled = true;
-            DoViewInCallers(sender, null);
+
+            // Check if a single node is selected before proceeding
+            // Exactly one node must be selected in order to view callers.
+            if (GetSelectedNodes().Count == 1)
+            {
+                DoViewInCallers(sender, null);
+            }
         }
+
         internal void DataGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
             var uiElement = sender as UIElement;
@@ -2757,10 +2764,18 @@ namespace PerfView
             var result = saveDialog.ShowDialog();
             if (result == true)
             {
-                if (FlameGraphCanvas.IsEmpty || m_RedrawFlameGraphWhenItBecomesVisible)
-                    RedrawFlameGraph();
+                try
+                {
+                    if (FlameGraphCanvas.IsEmpty || m_RedrawFlameGraphWhenItBecomesVisible)
+                        RedrawFlameGraph();
 
-                FlameGraph.Export(FlameGraphCanvas, saveDialog.FileName);
+                    FlameGraph.Export(FlameGraphCanvas, saveDialog.FileName);
+                    StatusBar.Log($"Saved flame graph to {saveDialog.FileName}");
+                }
+                catch (ArgumentOutOfRangeException ex)
+                {
+                    StatusBar.LogError($"Failed to save flame graph: {ex.Message}");
+                }
             }
         }
 
@@ -3108,7 +3123,14 @@ namespace PerfView
 
                 if (m_ViewsShouldBeSaved)
                 {
-                    var result = MessageBox.Show("You have created Notes that have not been saved\r\nDo you wish to save?", "Unsaved Notes", MessageBoxButton.YesNoCancel);
+                    var result = XamlMessageBox.Show(
+                        """
+                        You have created Notes that have not been saved.
+                        Do you wish to save?
+                        """,
+                        "Unsaved Notes",
+                        MessageBoxButton.YesNoCancel);
+
                     if (result == MessageBoxResult.Cancel)
                     {
                         e.Cancel = true;

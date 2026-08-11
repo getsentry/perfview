@@ -14,29 +14,37 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="xunit" Version="$(XunitVersion)" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="$(XunitRunnerVisualstudioVersion)" PrivateAssets="all" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.6.3" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(MicrosoftDiagnosticsRuntimeVersion)' != 'local'">
-    <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="$(MicrosoftDiagnosticsRuntimeVersion)" />
+    <PackageReference Include="Microsoft.Diagnostics.Runtime" />
   </ItemGroup>
   <ItemGroup Condition="'$(MicrosoftDiagnosticsRuntimeVersion)' == 'local'">
-    <PackageReference Include="System.Collections.Immutable" Version="5.0.0" />
+    <PackageReference Include="System.Collections.Immutable" />
     <Reference Include="Microsoft.Diagnostics.Runtime">
       <HintPath>$(MicrosoftDiagnosticsRuntimePath)</HintPath>
     </Reference>
   </ItemGroup>
 
-  <!-- Override the version of System.Text.Json that is transitively included to address security issues. -->
-  <ItemGroup>
-    <PackageReference Include="System.Text.Json" Version="$(SystemTextJsonVersion)" />
-  </ItemGroup>
-
   <ItemGroup>
     <ProjectReference Include="..\..\PerfView.TestUtilities\PerfView.TestUtilities.csproj" />
     <ProjectReference Include="..\TraceEvent.csproj" />
+    <!-- Built with <DebugType>embedded</DebugType>; consumed as an on-disk DLL (with its portable
+         PDB embedded in the PE image) by the embedded-PDB SymbolReader tests.  A normal project
+         reference ensures EmbeddedPdbTestApp.dll is copied to the test output directory. -->
+    <ProjectReference Include="EmbeddedPdbTestApp\EmbeddedPdbTestApp.csproj" />
+  </ItemGroup>
+
+  <!-- EmbeddedPdbTestApp is a separate project nested under this one.  Stop the default SDK globs
+       from pulling its sources (and generated obj\ files) into this test assembly's compilation. -->
+  <ItemGroup>
+    <Compile Remove="EmbeddedPdbTestApp\**\*.cs" />
+    <EmbeddedResource Remove="EmbeddedPdbTestApp\**\*" />
+    <None Remove="EmbeddedPdbTestApp\**\*" />
+    <Content Remove="EmbeddedPdbTestApp\**\*" />
   </ItemGroup>
 
   <ItemGroup>
