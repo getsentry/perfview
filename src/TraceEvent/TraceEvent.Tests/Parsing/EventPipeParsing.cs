@@ -248,7 +248,10 @@ namespace TraceEventTests
 
                     int stacksBeforeReset = 0;
                     int stacksAfterReset = -1;
-                    var stackAfterReset = new TaskCompletionSource<CallStackIndex>();
+                    // RunContinuationsAsynchronously so awaiting this cannot resume inline on the
+                    // event processing thread - the continuation below stops the session and waits
+                    // on the processing task, which would deadlock if it ran on that thread.
+                    var stackAfterReset = new TaskCompletionSource<CallStackIndex>(TaskCreationOptions.RunContinuationsAsynchronously);
 
                     sampleEventParser.ThreadSample += delegate (ClrThreadSampleTraceData e)
                     {
