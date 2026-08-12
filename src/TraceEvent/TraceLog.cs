@@ -7864,8 +7864,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </summary>
         internal void Clear()
         {
-            // GrowableArray.Clear() only resets the length, so assign fresh arrays to actually
-            // release the memory - callees and threads reference every List ever created.
+            // GrowableArray.Clear() only resets the length so we have to assign fresh arrays
             callStacks = new GrowableArray<CallStackInfo>();
             callees = new GrowableArray<List<CallStackIndex>>();
             threads = new GrowableArray<List<CallStackIndex>>();
