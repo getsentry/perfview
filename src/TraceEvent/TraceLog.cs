@@ -976,6 +976,43 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
 
         /// <summary>
+        /// Discards every call stack interned so far, releasing the memory held by the call stack
+        /// interning tables (see <see cref="CallStacks"/>).
+        /// <para>
+        /// In a real time session those tables grow for the lifetime of the session: every distinct
+        /// call stack that is observed is interned and nothing is ever released.  For a long running
+        /// process with diverse stacks that growth is unbounded.  Trace files do not have this problem
+        /// because the session is finite, which is why this is restricted to real time sessions.
+        /// </para>
+        /// <para>
+        /// Every <see cref="CallStackIndex"/> obtained before this call is invalidated and must not be
+        /// used afterwards, so only call this when no such index is still live.  Call stacks observed
+        /// after the call are interned from scratch, so no information is lost going forward - only
+        /// the ability to resolve indexes handed out earlier.
+        /// </para>
+        /// <para>
+        /// Must be called from the thread that processes events (for example from within an event
+        /// callback).  Calling it concurrently with event processing races with call stack interning.
+        /// </para>
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The TraceLog is not a real time session.</exception>
+        public void ResetCallStacks()
+        {
+            if (!IsRealTime)
+            {
+                throw new InvalidOperationException("ResetCallStacks is only supported for real time sessions.");
+            }
+
+            callStacks.Clear();
+
+            // These map events to the call stack indexes we have just invalidated, so they cannot be
+            // allowed to survive.  On the EventPipe real time path they are already cleared after every
+            // event; on the ETW path FlushRealTimeEvents only trims them, so clear them explicitly.
+            eventsToStacks.Clear();
+            cswitchBlockingEventsToStacks.Clear();
+        }
+
+        /// <summary>
         /// Given a process's virtual address 'address' and an event which acts as a
         /// context (determines which process and what time in that process), return
         /// a CodeAddressIndex (which represents a particular location in a particular
@@ -7819,6 +7856,24 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal void SetSize(int origSize)
         {
             callStacks.RemoveRange(origSize, callStacks.Count - origSize);
+        }
+
+        /// <summary>
+        /// Discards every interned call stack, returning the interning tables to their initial state.
+        /// Only meaningful for a real time session, where these tables would otherwise grow for the
+        /// lifetime of the session.  See <see cref="TraceLog.ResetCallStacks"/>.
+        /// </summary>
+        internal void Clear()
+        {
+            // Deliberately assign fresh arrays rather than calling GrowableArray.Clear().  Clear()
+            // only resets the length, so the backing arrays would survive - and for 'callees' and
+            // 'threads' those arrays hold references to every List<CallStackIndex> ever created,
+            // which is the bulk of the memory we are trying to release.
+            // InternCallStackIndex reallocates callStacks/callees on its next call, and 'threads'
+            // grows on demand, so no explicit re-initialization is needed here.
+            callStacks = new GrowableArray<CallStackInfo>();
+            callees = new GrowableArray<List<CallStackIndex>>();
+            threads = new GrowableArray<List<CallStackIndex>>();
         }
 
         /// <summary>
