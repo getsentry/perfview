@@ -1005,10 +1005,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             callStacks.Clear();
 
-            // These map events to the call stack indexes we have just invalidated, so they cannot be
-            // allowed to survive.  On the EventPipe real time path they are already cleared after every
-            // event; on the ETW path FlushRealTimeEvents only trims them, so clear them explicitly.
-            // Clearing the length is enough here - these hold structs, so nothing is retained.
+            // These map events to the indexes we just invalidated, so also need clearing.
+            // A length reset is enough here - they hold structs, so nothing is retained.
             eventsToStacks.Clear();
             cswitchBlockingEventsToStacks.Clear();
         }
