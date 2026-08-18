@@ -1023,8 +1023,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </para>
         /// <para>
         /// Must be called from within an event callback, on the thread dispatching that event.  Calling
-        /// it concurrently with event processing would race with call stack interning, so this is
-        /// enforced rather than merely documented.
+        /// it concurrently with event processing would race with call stack interning
         /// </para>
         /// </summary>
         /// <exception cref="InvalidOperationException">
