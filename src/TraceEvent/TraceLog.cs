@@ -384,7 +384,15 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             // We need to look up the event to get the dispatch Target assigned.
             TraceEvent rtEvent = realTimeSource.Lookup(data.eventRecord);
-            realTimeSource.Dispatch(rtEvent);
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
+            try
+            {
+                realTimeSource.Dispatch(rtEvent);
+            }
+            finally
+            {
+                m_DispatchThreadID = -1;
+            }
 
             // Clean up interim data structures - they're not necessary after the event has been processed (Dispatched).
             eventsToStacks.Clear();
@@ -871,6 +879,27 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
 
         /// <summary>
+        /// The managed thread ID of the thread currently dispatching an event to the real time source,
+        /// or -1 when no dispatch is in progress.
+        /// </summary>
+        private int m_DispatchThreadID = -1;
+
+        /// <summary>
+        /// Throws unless the caller is running on the thread that is currently dispatching an event.
+        /// Operations that mutate state the dispatcher is actively using can only run from within an
+        /// event callback, and this is how they enforce it.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The caller is not on the dispatch thread.</exception>
+        internal void ThrowIfNotRunningOnDispatchThread()
+        {
+            if (m_DispatchThreadID != Thread.CurrentThread.ManagedThreadId)
+            {
+                throw new InvalidOperationException(
+                    "This operation must be called from within an event callback, on the thread dispatching the event.");
+            }
+        }
+
+        /// <summary>
         /// Removes all but the last 'keepCount' entries in 'growableArray' by sliding them down.
         /// </summary>
         private static void RemoveAllButLastEntries<T>(ref GrowableArray<T> growableArray, int keepCount)
@@ -886,6 +915,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         {
             realTimeEvent = toSend;
             TraceEvent eventInRealTimeSource = null;
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
             try
             {
                 eventInRealTimeSource = realTimeSource.Lookup(toSend.eventRecord);
@@ -897,6 +927,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             finally
             {
                 realTimeEvent = null;
+                m_DispatchThreadID = -1;
             }
 
             // Optimization, remove 'toSend' from the finalization queue.
@@ -973,6 +1004,46 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             {
                 RemoveAllButLastEntries(ref cswitchBlockingEventsToStacks, realTimeQueue.Count);
             }
+        }
+
+        /// <summary>
+        /// Releases the state a live session can afford to discard.  Today that is the call stack
+        /// interning tables (see <see cref="CallStacks"/>); more may be trimmed here in future.
+        /// <para>
+        /// In a real time session those tables grow for the lifetime of the session: every distinct
+        /// call stack that is observed is interned and nothing is ever released.  For a long running
+        /// process with diverse stacks that growth is unbounded.  Trace files do not have this problem
+        /// because the session is finite, which is why this is restricted to real time sessions.
+        /// </para>
+        /// <para>
+        /// Every <see cref="CallStackIndex"/> obtained before this call is invalidated and must not be
+        /// used afterwards, so only call this when no such index is still live.  Call stacks observed
+        /// after the call are interned from scratch, so no information is lost going forward - only
+        /// the ability to resolve indexes handed out earlier.
+        /// </para>
+        /// <para>
+        /// Must be called from within an event callback, on the thread dispatching that event.  Calling
+        /// it concurrently with event processing would race with call stack interning
+        /// </para>
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// The TraceLog is not a real time session, or the caller is not on the dispatch thread.
+        /// </exception>
+        public void TrimLiveSessionState()
+        {
+            if (!IsRealTime)
+            {
+                throw new InvalidOperationException("TrimLiveSessionState is only supported for real time sessions.");
+            }
+
+            ThrowIfNotRunningOnDispatchThread();
+
+            callStacks.Clear();
+
+            // These map events to the indexes we just invalidated, so also need clearing.
+            // A length reset is enough here - they hold structs, so nothing is retained.
+            eventsToStacks.Clear();
+            cswitchBlockingEventsToStacks.Clear();
         }
 
         /// <summary>
@@ -7819,6 +7890,19 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal void SetSize(int origSize)
         {
             callStacks.RemoveRange(origSize, callStacks.Count - origSize);
+        }
+
+        /// <summary>
+        /// Discards every interned call stack, returning the interning tables to their initial state.
+        /// Only meaningful for a real time session, where these tables would otherwise grow for the
+        /// lifetime of the session.  See <see cref="TraceLog.TrimLiveSessionState"/>.
+        /// </summary>
+        internal void Clear()
+        {
+            // GrowableArray.Clear() only resets the length so we have to assign fresh arrays
+            callStacks = new GrowableArray<CallStackInfo>();
+            callees = new GrowableArray<List<CallStackIndex>>();
+            threads = new GrowableArray<List<CallStackIndex>>();
         }
 
         /// <summary>
