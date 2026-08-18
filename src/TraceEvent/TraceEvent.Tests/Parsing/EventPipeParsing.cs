@@ -223,11 +223,11 @@ namespace TraceEventTests
 #else
         [Fact(Skip = "EventPipeSession connection is only available to target apps on .NET Core 3.0 or later")]
 #endif
-        public async Task ResetCallStacksDiscardsInternedStacksAndKeepsInterning()
+        public async Task TrimLiveSessionStateDiscardsInternedStacksAndKeepsInterning()
         {
             // In a real time session the call stack interning tables grow for the lifetime of the
             // session: every distinct stack observed is interned and nothing is released, so a long
-            // running session grows without bound.  ResetCallStacks discards them.
+            // running session grows without bound.  TrimLiveSessionState discards them.
             //
             // This verifies both halves of the contract: the tables are actually emptied, and stacks
             // observed afterwards are still interned and still resolve to methods.
@@ -255,7 +255,7 @@ namespace TraceEventTests
 
                     sampleEventParser.ThreadSample += delegate (ClrThreadSampleTraceData e)
                     {
-                        // ResetCallStacks has to run on the thread that processes events, which is the
+                        // TrimLiveSessionState has to run on the thread that processes events, which is the
                         // thread this callback runs on.
                         if (stacksAfterReset < 0)
                         {
@@ -266,7 +266,7 @@ namespace TraceEventTests
                             }
 
                             stacksBeforeReset = traceLog.CallStacks.Count;
-                            traceLog.ResetCallStacks();
+                            traceLog.TrimLiveSessionState();
                             stacksAfterReset = traceLog.CallStacks.Count;
                             return;
                         }

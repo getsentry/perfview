@@ -976,8 +976,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
 
         /// <summary>
-        /// Discards every call stack interned so far, releasing the memory held by the call stack
-        /// interning tables (see <see cref="CallStacks"/>).
+        /// Releases the state a live session can afford to discard.  Today that is the call stack
+        /// interning tables (see <see cref="CallStacks"/>); more may be trimmed here in future.
         /// <para>
         /// In a real time session those tables grow for the lifetime of the session: every distinct
         /// call stack that is observed is interned and nothing is ever released.  For a long running
@@ -996,11 +996,11 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// </para>
         /// </summary>
         /// <exception cref="InvalidOperationException">The TraceLog is not a real time session.</exception>
-        public void ResetCallStacks()
+        public void TrimLiveSessionState()
         {
             if (!IsRealTime)
             {
-                throw new InvalidOperationException("ResetCallStacks is only supported for real time sessions.");
+                throw new InvalidOperationException("TrimLiveSessionState is only supported for real time sessions.");
             }
 
             callStacks.Clear();
@@ -7860,7 +7860,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// Discards every interned call stack, returning the interning tables to their initial state.
         /// Only meaningful for a real time session, where these tables would otherwise grow for the
-        /// lifetime of the session.  See <see cref="TraceLog.ResetCallStacks"/>.
+        /// lifetime of the session.  See <see cref="TraceLog.TrimLiveSessionState"/>.
         /// </summary>
         internal void Clear()
         {
