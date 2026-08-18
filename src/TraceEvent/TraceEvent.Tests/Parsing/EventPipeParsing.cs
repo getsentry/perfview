@@ -354,6 +354,41 @@ namespace TraceEventTests
             return RecursiveWork(depth - 1) + depth;
         }
 
+#if NETCOREAPP3_0_OR_GREATER
+        [Fact]
+#else
+        [Fact(Skip = "EventPipeSession connection is only available to target apps on .NET Core 3.0 or later")]
+#endif
+        public async Task TrimLiveSessionStateThrowsWhenCalledOffTheDispatchThread()
+        {
+            var client = new DiagnosticsClient(Process.GetCurrentProcess().Id);
+            var providers = new[]
+            {
+                new EventPipeProvider(SampleProfilerTraceEventParser.ProviderName, EventLevel.Informational),
+            };
+
+            using (var session = client.StartEventPipeSession(providers, requestRundown: false))
+            {
+                using (var traceSource = CreateFromEventPipeSession(session, EventPipeRundownConfiguration.None()))
+                {
+                    var traceLog = traceSource.TraceLog;
+
+                    // Wait until dispatching is under way, so we are asserting against a live dispatcher
+                    // rather than a session that has not started. The assertion below holds either way -
+                    // this thread is never the dispatch thread - so a timeout here is not a failure.
+                    var dispatching = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    traceSource.AllEvents += delegate (TraceEvent _) { dispatching.TrySetResult(true); };
+                    var processingTask = Task.Run(traceSource.Process);
+                    await Task.WhenAny(dispatching.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+
+                    Assert.Throws<InvalidOperationException>(() => traceLog.TrimLiveSessionState());
+
+                    session.Stop();
+                    await processingTask;
+                }
+            }
+        }
+
         [Fact]
         public void V1IsUnsupported()
         {

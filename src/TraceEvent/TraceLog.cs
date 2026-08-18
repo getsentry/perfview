@@ -384,7 +384,15 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             // We need to look up the event to get the dispatch Target assigned.
             TraceEvent rtEvent = realTimeSource.Lookup(data.eventRecord);
-            realTimeSource.Dispatch(rtEvent);
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
+            try
+            {
+                realTimeSource.Dispatch(rtEvent);
+            }
+            finally
+            {
+                m_DispatchThreadID = -1;
+            }
 
             // Clean up interim data structures - they're not necessary after the event has been processed (Dispatched).
             eventsToStacks.Clear();
@@ -871,6 +879,27 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
 
         /// <summary>
+        /// The managed thread ID of the thread currently dispatching an event to the real time source,
+        /// or -1 when no dispatch is in progress.
+        /// </summary>
+        private int m_DispatchThreadID = -1;
+
+        /// <summary>
+        /// Throws unless the caller is running on the thread that is currently dispatching an event.
+        /// Operations that mutate state the dispatcher is actively using can only run from within an
+        /// event callback, and this is how they enforce it.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The caller is not on the dispatch thread.</exception>
+        internal void ThrowIfNotRunningOnDispatchThread()
+        {
+            if (m_DispatchThreadID != Thread.CurrentThread.ManagedThreadId)
+            {
+                throw new InvalidOperationException(
+                    "This operation must be called from within an event callback, on the thread dispatching the event.");
+            }
+        }
+
+        /// <summary>
         /// Removes all but the last 'keepCount' entries in 'growableArray' by sliding them down.
         /// </summary>
         private static void RemoveAllButLastEntries<T>(ref GrowableArray<T> growableArray, int keepCount)
@@ -886,6 +915,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         {
             realTimeEvent = toSend;
             TraceEvent eventInRealTimeSource = null;
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
             try
             {
                 eventInRealTimeSource = realTimeSource.Lookup(toSend.eventRecord);
@@ -897,6 +927,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             finally
             {
                 realTimeEvent = null;
+                m_DispatchThreadID = -1;
             }
 
             // Optimization, remove 'toSend' from the finalization queue.
@@ -991,17 +1022,22 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// the ability to resolve indexes handed out earlier.
         /// </para>
         /// <para>
-        /// Must be called from the thread that processes events (for example from within an event
-        /// callback).  Calling it concurrently with event processing races with call stack interning.
+        /// Must be called from within an event callback, on the thread dispatching that event.  Calling
+        /// it concurrently with event processing would race with call stack interning, so this is
+        /// enforced rather than merely documented.
         /// </para>
         /// </summary>
-        /// <exception cref="InvalidOperationException">The TraceLog is not a real time session.</exception>
+        /// <exception cref="InvalidOperationException">
+        /// The TraceLog is not a real time session, or the caller is not on the dispatch thread.
+        /// </exception>
         public void TrimLiveSessionState()
         {
             if (!IsRealTime)
             {
                 throw new InvalidOperationException("TrimLiveSessionState is only supported for real time sessions.");
             }
+
+            ThrowIfNotRunningOnDispatchThread();
 
             callStacks.Clear();
 
