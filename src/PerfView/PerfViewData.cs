@@ -4571,7 +4571,19 @@ namespace PerfView
             return ret;
         }
 
-        // TODO not clear I want this method 
+        public virtual StackSource GetStackSource(TextWriter log, double startRelativeMSec, double endRelativeMSec, Predicate<TraceEvent> predicate)
+        {
+            StackSource ret = DataFile.OpenStackSourceImpl(SourceName, log, startRelativeMSec, endRelativeMSec, predicate);
+
+            if (ret == null)
+            {
+                throw new ApplicationException($"The {SourceName} does not support filtering by selected events.");
+            }
+
+            return ret;
+        }
+
+        // TODO not clear I want this method
         protected virtual StackSource OpenStackSource(
             string streamName, TextWriter log, double startRelativeMSec = 0, double endRelativeMSec = double.PositiveInfinity, Predicate<TraceEvent> predicate = null)
         {
@@ -7673,7 +7685,7 @@ namespace PerfView
                 if (App.UserConfigData["WarnedAboutOsHeapAllocTypes"] == null)
                 {
                     XamlMessageBox.Show(
-                        stackWindow,
+                        stackWindow.ParentWindow,
                         """
                         Warning: Allocation type resolution only happens on window launch.
                         Thus if you manually lookup symbols in this view you will get method

@@ -346,8 +346,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 TraceProcess process = processes.GetOrCreateProcess(data.ProcessID, data.TimeStampQPC);
                 process.InsertJITTEDMethod(data.MethodStartAddress, data.MethodSize, delegate ()
                 {
-                    TraceManagedModule module = process.LoadedModules.GetOrCreateManagedModule(data.ModuleID, data.TimeStampQPC);
-                    MethodIndex methodIndex = CodeAddresses.Methods.NewMethod(GetFullName(data), module.ModuleFile.ModuleFileIndex, data.MethodToken);
+                    TraceModuleFile moduleFile = process.LoadedModules.GetOrCreateMethodModuleFile(data);
+                    MethodIndex methodIndex = CodeAddresses.Methods.NewMethod(GetFullName(data), moduleFile.ModuleFileIndex, data.MethodToken);
                     return new TraceProcess.MethodLookupInfo(data.MethodStartAddress, data.MethodSize, methodIndex);
                 });
             };
@@ -384,7 +384,15 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
             // We need to look up the event to get the dispatch Target assigned.
             TraceEvent rtEvent = realTimeSource.Lookup(data.eventRecord);
-            realTimeSource.Dispatch(rtEvent);
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
+            try
+            {
+                realTimeSource.Dispatch(rtEvent);
+            }
+            finally
+            {
+                m_DispatchThreadID = -1;
+            }
 
             // Clean up interim data structures - they're not necessary after the event has been processed (Dispatched).
             eventsToStacks.Clear();
@@ -871,6 +879,27 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
 
         /// <summary>
+        /// The managed thread ID of the thread currently dispatching an event to the real time source,
+        /// or -1 when no dispatch is in progress.
+        /// </summary>
+        private int m_DispatchThreadID = -1;
+
+        /// <summary>
+        /// Throws unless the caller is running on the thread that is currently dispatching an event.
+        /// Operations that mutate state the dispatcher is actively using can only run from within an
+        /// event callback, and this is how they enforce it.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The caller is not on the dispatch thread.</exception>
+        internal void ThrowIfNotRunningOnDispatchThread()
+        {
+            if (m_DispatchThreadID != Thread.CurrentThread.ManagedThreadId)
+            {
+                throw new InvalidOperationException(
+                    "This operation must be called from within an event callback, on the thread dispatching the event.");
+            }
+        }
+
+        /// <summary>
         /// Removes all but the last 'keepCount' entries in 'growableArray' by sliding them down.
         /// </summary>
         private static void RemoveAllButLastEntries<T>(ref GrowableArray<T> growableArray, int keepCount)
@@ -886,6 +915,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         {
             realTimeEvent = toSend;
             TraceEvent eventInRealTimeSource = null;
+            m_DispatchThreadID = Thread.CurrentThread.ManagedThreadId;
             try
             {
                 eventInRealTimeSource = realTimeSource.Lookup(toSend.eventRecord);
@@ -897,6 +927,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             finally
             {
                 realTimeEvent = null;
+                m_DispatchThreadID = -1;
             }
 
             // Optimization, remove 'toSend' from the finalization queue.
@@ -973,6 +1004,46 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             {
                 RemoveAllButLastEntries(ref cswitchBlockingEventsToStacks, realTimeQueue.Count);
             }
+        }
+
+        /// <summary>
+        /// Releases the state a live session can afford to discard.  Today that is the call stack
+        /// interning tables (see <see cref="CallStacks"/>); more may be trimmed here in future.
+        /// <para>
+        /// In a real time session those tables grow for the lifetime of the session: every distinct
+        /// call stack that is observed is interned and nothing is ever released.  For a long running
+        /// process with diverse stacks that growth is unbounded.  Trace files do not have this problem
+        /// because the session is finite, which is why this is restricted to real time sessions.
+        /// </para>
+        /// <para>
+        /// Every <see cref="CallStackIndex"/> obtained before this call is invalidated and must not be
+        /// used afterwards, so only call this when no such index is still live.  Call stacks observed
+        /// after the call are interned from scratch, so no information is lost going forward - only
+        /// the ability to resolve indexes handed out earlier.
+        /// </para>
+        /// <para>
+        /// Must be called from within an event callback, on the thread dispatching that event.  Calling
+        /// it concurrently with event processing would race with call stack interning
+        /// </para>
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// The TraceLog is not a real time session, or the caller is not on the dispatch thread.
+        /// </exception>
+        public void TrimLiveSessionState()
+        {
+            if (!IsRealTime)
+            {
+                throw new InvalidOperationException("TrimLiveSessionState is only supported for real time sessions.");
+            }
+
+            ThrowIfNotRunningOnDispatchThread();
+
+            callStacks.Clear();
+
+            // These map events to the indexes we just invalidated, so also need clearing.
+            // A length reset is enough here - they hold structs, so nothing is retained.
+            eventsToStacks.Clear();
+            cswitchBlockingEventsToStacks.Clear();
         }
 
         /// <summary>
@@ -1363,7 +1434,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             eventCount = 0;
 
             // FIX NOW HACK, because Method and Module unload methods are missing.
-            jittedMethods = new List<MethodLoadUnloadVerboseTraceData>();
+            methodLoadEvents = new List<MethodLoadUnloadVerboseTraceData>();
             jsJittedMethods = new List<MethodLoadUnloadJSTraceData>();
             sourceFilesByID = new Dictionary<JavaScriptSourceKey, string>();
 
@@ -1684,17 +1755,17 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                         bookKeepingEvent = true;
                     }
 
-                    if (data.IsJitted)
+                    if (ShouldTrackMethodLoad(data.MethodFlags))
                     {
                         TraceProcess process = processes.GetOrCreateProcess(data.ProcessID, data.TimeStampQPC);
                         process.InsertJITTEDMethod(data.MethodStartAddress, data.MethodSize, delegate ()
                         {
-                            TraceManagedModule module = process.LoadedModules.GetOrCreateManagedModule(data.ModuleID, data.TimeStampQPC);
-                            MethodIndex methodIndex = CodeAddresses.Methods.NewMethod(TraceLog.GetFullName(data), module.ModuleFile.ModuleFileIndex, data.MethodToken);
+                            TraceModuleFile moduleFile = process.LoadedModules.GetOrCreateMethodModuleFile(data);
+                            MethodIndex methodIndex = CodeAddresses.Methods.NewMethod(TraceLog.GetFullName(data), moduleFile.ModuleFileIndex, data.MethodToken);
                             return new TraceProcess.MethodLookupInfo(data.MethodStartAddress, data.MethodSize, methodIndex);
                         });
 
-                        jittedMethods.Add((MethodLoadUnloadVerboseTraceData)data.Clone());
+                        methodLoadEvents.Add((MethodLoadUnloadVerboseTraceData)data.Clone());
                     }
                 };
             rawEvents.Clr.MethodLoadVerbose += onMethodStart;
@@ -2427,9 +2498,9 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             userStackKeyToInfo = null;
 
             // TODO FIX NOW hack because unloadMethod not present
-            foreach (var jittedMethod in jittedMethods)
+            foreach (var methodLoadEvent in methodLoadEvents)
             {
-                codeAddresses.AddMethod(jittedMethod);
+                codeAddresses.AddMethod(methodLoadEvent);
             }
 
             foreach (var jsJittedMethod in jsJittedMethods)
@@ -3531,20 +3602,34 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         }
         internal static string GetFullName(MethodLoadUnloadVerboseTraceData data)
         {
-            string sig = data.MethodSignature;
-            int parens = sig.IndexOf('(');
+            return GetFullName(data.MethodFlags, data.MethodNamespace, data.MethodName, data.MethodSignature);
+        }
+
+        private static string GetFullName(MethodFlags methodFlags, string methodNamespace, string methodName, string methodSignature)
+        {
+            if ((methodFlags & MethodFlags.JitHelper) != 0)
+            {
+                return methodName;
+            }
+
+            int parens = methodSignature.IndexOf('(');
             string args;
             if (parens >= 0)
             {
-                args = sig.Substring(parens);
+                args = methodSignature.Substring(parens);
             }
             else
             {
                 args = "";
             }
 
-            string fullName = data.MethodNamespace + "." + data.MethodName + args;
+            string fullName = methodNamespace + "." + methodName + args;
             return fullName;
+        }
+
+        private static bool ShouldTrackMethodLoad(MethodFlags methodFlags)
+        {
+            return (methodFlags & (MethodFlags.Jitted | MethodFlags.JitHelper)) != 0;
         }
 
         internal int FindPageIndex(long timeQPC)
@@ -4202,8 +4287,8 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         private bool noStack;                               // This event should never have a stack associated with it, so skip them if we every try to attach a stack.
         private TraceThread thread;                         // cache of the TraceThread for the current event.
 
-        // TODO FIX NOW remove the jittedMethods ones.
-        private List<MethodLoadUnloadVerboseTraceData> jittedMethods;
+        // TODO FIX NOW remove the methodLoadEvents ones.
+        private List<MethodLoadUnloadVerboseTraceData> methodLoadEvents;
         private List<MethodLoadUnloadJSTraceData> jsJittedMethods;
         private Dictionary<JavaScriptSourceKey, string> sourceFilesByID;
 
@@ -7225,6 +7310,29 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             }
             return module;
         }
+
+        internal TraceModuleFile GetOrCreateMethodModuleFile(MethodLoadUnloadVerboseTraceData data)
+        {
+            if (data.IsJitHelper)
+            {
+                return GetOrCreateJitHelperModuleFile();
+            }
+
+            return GetOrCreateManagedModule(data.ModuleID, data.TimeStampQPC).ModuleFile;
+        }
+
+        private TraceModuleFile GetOrCreateJitHelperModuleFile()
+        {
+            if (jitHelperModuleFile == null)
+            {
+                // Stash process-private, dynamically generated runtime helpers under an invalid file path
+                // so they are clearly synthetic while still displaying cleanly in stacks.
+                string modulePath = "[generatedruntimehelpers:processindex=" + process.ProcessIndex + "]\\generatedruntimehelpers.dll";
+                jitHelperModuleFile = process.Log.ModuleFiles.GetOrCreateModuleFile(modulePath, 0);
+            }
+
+            return jitHelperModuleFile;
+        }
         /// <summary>
         /// Finds the index and module for an a given managed module ID.  If not found, new module
         /// should be inserted at index + 1;
@@ -7411,6 +7519,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
 
         private TraceProcess process;
         private GrowableArray<TraceLoadedModule> modules;               // Contains unmanaged modules sorted by key
+        private TraceModuleFile jitHelperModuleFile;
         #endregion
     }
 
@@ -7819,6 +7928,19 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         internal void SetSize(int origSize)
         {
             callStacks.RemoveRange(origSize, callStacks.Count - origSize);
+        }
+
+        /// <summary>
+        /// Discards every interned call stack, returning the interning tables to their initial state.
+        /// Only meaningful for a real time session, where these tables would otherwise grow for the
+        /// lifetime of the session.  See <see cref="TraceLog.TrimLiveSessionState"/>.
+        /// </summary>
+        internal void Clear()
+        {
+            // GrowableArray.Clear() only resets the length so we have to assign fresh arrays
+            callStacks = new GrowableArray<CallStackInfo>();
+            callees = new GrowableArray<List<CallStackIndex>>();
+            threads = new GrowableArray<List<CallStackIndex>>();
         }
 
         /// <summary>
@@ -8536,7 +8658,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             MethodIndex methodIndex = Microsoft.Diagnostics.Tracing.Etlx.MethodIndex.Invalid;
             ILMapIndex ilMap = ILMapIndex.Invalid;
             ModuleFileIndex moduleFileIndex = Microsoft.Diagnostics.Tracing.Etlx.ModuleFileIndex.Invalid;
-            TraceManagedModule module = null;
+            TraceModuleFile moduleFile = null;
             TraceProcess process = log.Processes.GetOrCreateProcess(data.ProcessID, data.TimeStampQPC);
             ForAllUnresolvedCodeAddressesInRange(process, data.MethodStartAddress, data.MethodSize, true, delegate (ref CodeAddressInfo info)
             {
@@ -8545,10 +8667,10 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
                 if (info.GetMethodIndex(this) == Microsoft.Diagnostics.Tracing.Etlx.MethodIndex.Invalid)
                 {
                     // Lazily create the method since many methods never have code samples in them.
-                    if (module == null)
+                    if (moduleFile == null)
                     {
-                        module = process.LoadedModules.GetOrCreateManagedModule(data.ModuleID, data.TimeStampQPC);
-                        moduleFileIndex = module.ModuleFile.ModuleFileIndex;
+                        moduleFile = process.LoadedModules.GetOrCreateMethodModuleFile(data);
+                        moduleFileIndex = moduleFile.ModuleFileIndex;
                         methodIndex = methods.NewMethod(TraceLog.GetFullName(data), moduleFileIndex, data.MethodToken);
                         if (data.IsJitted)
                         {

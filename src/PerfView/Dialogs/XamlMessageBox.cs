@@ -57,7 +57,7 @@ public static class XamlMessageBox
         }
 
         MessageBoxWindow window = new(message, caption, buttons, icon, defaultResult);
-        if (owner is not null)
+        if (owner?.IsLoaded == true)
         {
             window.Owner = owner;
         }

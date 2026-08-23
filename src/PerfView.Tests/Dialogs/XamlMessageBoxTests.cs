@@ -18,6 +18,7 @@ namespace PerfViewTests.Dialogs
         /// to the UI thread when called from a background thread, rather than throwing
         /// "The calling thread must be STA, because many UI components require this."
         /// Also verifies that calling from the UI thread directly still works (no-op dispatch).
+        /// An owner which has never been shown must also be ignored rather than assigned.
         /// This is the core regression test for issue #2300.
         /// </summary>
 #pragma warning disable VSTHRD200 // Keep the original regression test name stable.
@@ -35,7 +36,15 @@ namespace PerfViewTests.Dialogs
             // Part 1: Call directly from the UI thread (dispatch is a no-op).
             MessageBoxResult uiResult = XamlMessageBox.Show("Test message", "XamlMBTest_UI", MessageBoxButton.OK);
 
-            // Part 2: Call from a background thread — before the fix for issue #2300,
+            // Part 2: Use an owner that has not been shown.
+            Window unshownOwner = new Window();
+            MessageBoxResult unshownOwnerResult = XamlMessageBox.Show(
+                unshownOwner,
+                "Test message",
+                "XamlMBTest_UnshownOwner",
+                MessageBoxButton.OK);
+
+            // Part 3: Call from a background thread — before the fix for issue #2300,
             // this would throw InvalidOperationException ("The calling thread must be STA")
             // because XamlMessageBox creates a WPF Window requiring the UI thread.
             Task<MessageBoxResult> backgroundShowTask = Task.Run(() =>
@@ -48,9 +57,11 @@ namespace PerfViewTests.Dialogs
 
             MessageBoxResult bgResult = await backgroundShowTask;
 
-            // Both dialogs were auto-closed without clicking a button, so Result is None.
+            // All dialogs were auto-closed without clicking a button, so Result is None.
             Assert.Equal(MessageBoxResult.None, uiResult);
+            Assert.Equal(MessageBoxResult.None, unshownOwnerResult);
             Assert.Equal(MessageBoxResult.None, bgResult);
+            Assert.False(unshownOwner.IsLoaded);
         }
 
         private static bool s_autoCloseHandlerRegistered;

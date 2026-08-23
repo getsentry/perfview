@@ -1,6 +1,9 @@
-﻿using EventSources;
+﻿using Diagnostics.Tracing.StackSources;
+using EventSources;
 using Microsoft.Diagnostics.Symbols;
+using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Etlx;
+using Microsoft.Diagnostics.Tracing.Stacks;
 using Microsoft.Diagnostics.Tracing.TraceUtilities.FilterQueryExpression;
 using Microsoft.Diagnostics.Utilities;
 using Microsoft.IdentityModel.Tokens;
@@ -458,42 +461,39 @@ namespace PerfView
                 // If we have selected exactly two items, use that as the time limits, otherwise use what is the my dialog.
                 var startTimeRelativeMSec = m_source.StartTimeRelativeMSec;
                 var endTimeRelativeMSec = m_source.EndTimeRelativeMSec;
-                var selectedCells = Grid.SelectedCells;
-                if (selectedCells.Count == 1 || selectedCells.Count == 2)
+                var selectedCells = Grid.SelectedCells.ToList();
+                if (selectedCells.Count == 2)
                 {
                     string start = GetCellStringValue(selectedCells[0]);
                     double parsedStart;
                     if (!double.TryParse(start, out parsedStart))
                     {
-                        if (selectedCells.Count != 1)
-                        {
                             StatusBar.LogError("Could not parse " + start + " as a number.");
+                            OpenSelectedStacks(stackSourceName, selectedCells);
                             return;
-                        }
-                        StatusBar.Log("Assuming total current time range");
                     }
-                    else
-                    {
-                        startTimeRelativeMSec = parsedStart;
-                        endTimeRelativeMSec = parsedStart;
-                        if (selectedCells.Count == 2)
-                        {
-                            string end = GetCellStringValue(selectedCells[1]);
-                            if (!double.TryParse(end, out endTimeRelativeMSec))
-                            {
-                                StatusBar.LogError("Could not parse " + end + " as a number.");
-                                return;
-                            }
-                        }
 
-                        // Make sure that start < end
-                        if (endTimeRelativeMSec < startTimeRelativeMSec)
-                        {
-                            var tmp = startTimeRelativeMSec;
-                            startTimeRelativeMSec = endTimeRelativeMSec;
-                            endTimeRelativeMSec = tmp;
-                        }
+                    startTimeRelativeMSec = parsedStart;
+                    string end = this.GetCellStringValue(selectedCells[1]);
+                    if (!double.TryParse(end, out endTimeRelativeMSec))
+                    {
+                        this.StatusBar.LogError("Could not parse " + end + " as a number.");
+                        this.OpenSelectedStacks(stackSourceName, selectedCells);
+                        return;
                     }
+
+                    // Make sure that start < end
+                    if (endTimeRelativeMSec < startTimeRelativeMSec)
+                    {
+                        var tmp = startTimeRelativeMSec;
+                        startTimeRelativeMSec = endTimeRelativeMSec;
+                        endTimeRelativeMSec = tmp;
+                    }
+                }
+                else if (selectedCells.Count > 0)
+                {
+                    OpenSelectedStacks(stackSourceName, selectedCells);
+                    return;
                 }
 
                 // TODO FIX NOW: this should call a routine that does the opening of the stack view
@@ -557,6 +557,126 @@ namespace PerfView
                 });
             }
         }
+
+        private void OpenSelectedStacks(string stackSourceName, IList<DataGridCellInfo> selectedCells)
+        {
+            if (selectedCells == null || selectedCells.Count == 0)
+            {
+                StatusBar.LogError("No events selected.");
+                return;
+            }
+
+            StatusBar.StartWork("Reading " + DataSource.Name, delegate ()
+            {
+                PerfViewStackSource dataSource = null;
+                var dataFile = DataSource.DataFile;
+                if (dataFile != null)
+                {
+                    if (stackSourceName == null)
+                    {
+                        stackSourceName = dataFile.DefaultStackSourceName;
+                    }
+
+                    dataSource = dataFile.GetStackSource(stackSourceName);
+                }
+
+                if (dataSource == null)
+                {
+                    throw new ApplicationException("Could not find stack source " + stackSourceName);
+                }
+
+                // Collect unique event records (a row may have multiple selected cells).
+                var uniqueRecords = selectedCells
+                    .Select(c => c.Item as EventRecord)
+                    .Where(r => r != null)
+                    .Distinct()
+                    .ToList();
+
+                if (uniqueRecords.Count == 0)
+                {
+                    StatusBar.EndWork(delegate ()
+                    {
+                        StatusBar.LogError("No event records found in selection.");
+                    });
+                    return;
+                }
+
+                StackSource aggregateSource;
+
+                // For ETW sources, filter by exact EventIndex so concurrent events on other
+                // threads at the same timestamp are excluded.
+                var etwRecords = uniqueRecords.OfType<ETWEventSource.ETWEventRecord>().ToList();
+                double startTimeRelativeMSec;
+                double endTimeRelativeMSec;
+                if (etwRecords.Count == uniqueRecords.Count)
+                {
+                    startTimeRelativeMSec = etwRecords.Min(r => r.TimeStampRelatveMSec);
+                    endTimeRelativeMSec = etwRecords.Max(r => r.TimeStampRelatveMSec);
+
+                    var selectedIndices = new HashSet<EventIndex>(etwRecords.Select(r => r.Index));
+                    aggregateSource = dataSource.GetStackSource(
+                        StatusBar.LogWriter,
+                        startTimeRelativeMSec - .001,
+                        endTimeRelativeMSec + .001,
+                        data => selectedIndices.Contains(data.EventIndex));
+                }
+                else
+                {
+                    // Non-ETW records have no EventIndex for an exact event filter.
+                    // Use one stack source covering the selected records' time range.
+                    startTimeRelativeMSec = uniqueRecords.Min(r => r.TimeStampRelatveMSec);
+                    endTimeRelativeMSec = uniqueRecords.Max(r => r.TimeStampRelatveMSec);
+                    aggregateSource = dataSource.GetStackSource(
+                        StatusBar.LogWriter,
+                        startTimeRelativeMSec - .001,
+                        endTimeRelativeMSec + .001);
+                }
+
+                if (aggregateSource == null)
+                {
+                    StatusBar.EndWork(delegate ()
+                    {
+                        StatusBar.LogError("Could not open stacks for selected events.");
+                    });
+                    return;
+                }
+
+                if (!m_lookedUpCachedSymbolsForETLData)
+                {
+                    m_lookedUpCachedSymbolsForETLData = true;
+                    StatusBar.Log("Quick Looking up symbols from PDB cache.");
+                    var etlDataFile = dataFile as ETLPerfViewData;
+                    if (etlDataFile != null)
+                    {
+                        var traceLog = etlDataFile.GetTraceLog(StatusBar.LogWriter);
+                        using (var reader = etlDataFile.GetSymbolReader(StatusBar.LogWriter,
+                                   SymbolReaderOptions.CacheOnly | SymbolReaderOptions.NoNGenSymbolCreation))
+                        {
+                            var moduleFiles = ETLPerfViewData.GetInterestingModuleFiles(etlDataFile, 5.0, StatusBar.LogWriter, null);
+                            foreach (var moduleFile in moduleFiles)
+                            {
+                                traceLog.CodeAddresses.LookupSymbolsForModule(reader, moduleFile);
+                            }
+                        }
+                    }
+                    StatusBar.Log("Quick Done looking up symbols from PDB cache.");
+                }
+
+                StatusBar.EndWork(delegate ()
+                {
+                    App.CommandProcessor.NoExitOnElevate = true;
+
+                    var stackWindow = new PerfView.StackWindow(this, dataSource);
+                    stackWindow.StatusBar.Log("Read " + DataSource.Name);
+                    dataSource.ConfigureStackWindow(stackWindow);
+                    stackWindow.StartTextBox.Text = startTimeRelativeMSec.ToString();
+                    stackWindow.EndTextBox.Text = endTimeRelativeMSec.ToString();
+                    stackWindow.Show();
+                    stackWindow.SetStackSource(aggregateSource);
+                });
+            });
+        }
+
         private void DoProcessFilter(object sender, ExecutedRoutedEventArgs e)
         {
             var selectedCells = Grid.SelectedCells;
